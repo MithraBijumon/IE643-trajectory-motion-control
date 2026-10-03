@@ -1,0 +1,7 @@
+numpy
+torch
+imageio[ffmpeg]
+Pillow
+diffusers
+transformers
+accelerate
