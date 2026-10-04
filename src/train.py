@@ -94,10 +94,7 @@ condition_encoder = ConditionEncoder()
 
 adapter = MotionAdapter(dim=128)
 
-condition_encoder = condition_encoder.to(
-    DEVICE,
-    dtype=DTYPE,
-)
+condition_encoder = condition_encoder.to(DEVICE)
 
 adapter = adapter.to(
     DEVICE,
@@ -216,6 +213,8 @@ for epoch in range(EPOCHS):
         condition = condition.permute(
             0, 2, 1, 3, 4
         )
+
+        condition = condition.float()
 
         # now:
         # [B,3,F,H,W]
