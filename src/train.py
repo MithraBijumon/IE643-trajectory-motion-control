@@ -30,7 +30,7 @@ LR = 1e-4
 EPOCHS = 10
 
 DEVICE = "cuda"
-DTYPE = torch.bfloat16
+DTYPE = torch.float32
 
 SAVE_DIR = "checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
