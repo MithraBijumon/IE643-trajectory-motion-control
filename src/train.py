@@ -171,6 +171,9 @@ for epoch in range(EPOCHS):
             dtype=DTYPE,
         )
 
+        print("RAW DATASET VIDEO:", video.shape)
+        print("RAW DATASET TRAJECTORY:", trajectory.shape)
+
         trajectory = batch["trajectory"].to(
             DEVICE,
             dtype=torch.float32,
