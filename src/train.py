@@ -19,7 +19,7 @@ from src.adapter import MotionAdapter
 
 MODEL_ID = "Lightricks/LTX-Video-0.9.7-dev"
 
-DATA_ROOT = "data/dataset"
+DATA_ROOT = os.environ.get("DATA_ROOT", "data/dataset")
 
 NUM_FRAMES = 33
 HEIGHT = 480
