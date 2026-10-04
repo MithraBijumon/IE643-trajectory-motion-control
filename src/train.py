@@ -313,11 +313,11 @@ for epoch in range(EPOCHS):
         # -------------------------------------------------
         # 9. Apply trajectory adapter
         # -------------------------------------------------
-        print(condition_tokens.dtype, noisy_tokens.dtype)
         adapted_tokens = adapter(
             noisy_tokens,
             condition_tokens,
         )
+        print(adapted_tokens.dtype)
 
         # -------------------------------------------------
         # 10. LTX timestep format
@@ -370,7 +370,7 @@ for epoch in range(EPOCHS):
             num_frames=video_latent.shape[2],
             height=video_latent.shape[3],
             width=video_latent.shape[4],
-            
+
             return_dict=False,
         )[0]
 
