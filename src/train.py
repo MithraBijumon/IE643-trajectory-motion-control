@@ -313,7 +313,7 @@ for epoch in range(EPOCHS):
         # -------------------------------------------------
         # 9. Apply trajectory adapter
         # -------------------------------------------------
-
+        print(condition_tokens.dtype, noisy_tokens.dtype)
         adapted_tokens = adapter(
             noisy_tokens,
             condition_tokens,
