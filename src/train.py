@@ -366,6 +366,11 @@ for epoch in range(EPOCHS):
             encoder_hidden_states=prompt_embeds,
             timestep=timestep_input,
             encoder_attention_mask=prompt_attention_mask,
+
+            num_frames=video_latent.shape[2],
+            height=video_latent.shape[3],
+            width=video_latent.shape[4],
+            
             return_dict=False,
         )[0]
 
