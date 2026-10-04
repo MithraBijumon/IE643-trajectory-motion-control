@@ -317,7 +317,6 @@ for epoch in range(EPOCHS):
             noisy_tokens,
             condition_tokens,
         )
-        print(adapted_tokens.dtype)
 
         # -------------------------------------------------
         # 10. LTX timestep format
@@ -360,7 +359,10 @@ for epoch in range(EPOCHS):
         # -------------------------------------------------
         # 12. LTX forward pass
         # -------------------------------------------------
-
+        adapted_tokens = adapted_tokens.to(
+            dtype=transformer.dtype
+        )
+        
         noise_pred = transformer(
             hidden_states=adapted_tokens,
             encoder_hidden_states=prompt_embeds,
