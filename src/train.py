@@ -171,8 +171,7 @@ for epoch in range(EPOCHS):
             dtype=DTYPE,
         )
 
-        print("RAW DATASET VIDEO:", video.shape)
-        print("RAW DATASET TRAJECTORY:", trajectory.shape)
+        video = video.permute(0, 2, 1, 3, 4)
 
         trajectory = batch["trajectory"].to(
             DEVICE,
