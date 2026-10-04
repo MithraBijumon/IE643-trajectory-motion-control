@@ -30,7 +30,7 @@ LR = 1e-4
 EPOCHS = 10
 
 DEVICE = "cuda"
-DTYPE = torch.float32
+DTYPE = torch.bfloat16
 
 SAVE_DIR = "checkpoints"
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -98,7 +98,7 @@ condition_encoder = condition_encoder.to(DEVICE)
 
 adapter = adapter.to(
     DEVICE,
-    dtype=DTYPE,
+    dtype=torch.float32,
 )
 
 
@@ -295,7 +295,7 @@ for epoch in range(EPOCHS):
 
         alpha = alpha.view(
             B, 1, 1, 1, 1
-        ).to(DTYPE)
+        ).to(torch.float32)
 
         noisy_latent = (
             alpha.sqrt() * video_latent
