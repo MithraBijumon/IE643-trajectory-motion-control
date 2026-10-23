@@ -119,6 +119,9 @@ def main():
     if args.resume:
         ckpt = backbone.load_checkpoint(args.resume)
         optimizer.load_state_dict(ckpt["optimizer"])
+        # load_state_dict restores the old lrs; re-apply the ones from the config
+        optimizer.param_groups[0]["lr"] = t["lr"]
+        optimizer.param_groups[1]["lr"] = t["scale_lr"]
         start_epoch = ckpt["epoch"]
         best_val = ckpt.get("best_val", best_val)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
