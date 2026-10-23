@@ -3,6 +3,7 @@ import os
 import imageio.v2 as imageio
 import numpy as np
 import torch
+import torch.nn.functional as F_nn
 from torch.utils.data import Dataset
 
 
@@ -14,7 +15,11 @@ class TrajectoryDataset(Dataset):
         num_frames=33,
         random_crop=True,
         load_video=True,
+        height=None,
+        width=None,
     ):
+        self.height = height
+        self.width = width
         self.num_frames = num_frames
         self.random_crop = random_crop
         self.load_video = load_video
@@ -78,6 +83,16 @@ class TrajectoryDataset(Dataset):
                 / 127.5
                 - 1
             )
+
+            # Trajectories are normalized to [0, 1], so resizing keeps them valid.
+            if self.height and video.shape[-2:] != (self.height, self.width):
+                video = F_nn.interpolate(
+                    video,
+                    size=(self.height, self.width),
+                    mode="bilinear",
+                    antialias=True,
+                    align_corners=False,
+                )
 
             item["video"] = video
             item["image"] = video[0]

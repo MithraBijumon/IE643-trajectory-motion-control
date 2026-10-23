@@ -1,0 +1,49 @@
+# Motion-controlled video generation: LTX-Video + trajectory adapter.
+# Every script reads this file; CLI flags override individual values.
+
+model:
+  id: Lightricks/LTX-Video-0.9.7-dev
+  dtype: bfloat16                # dtype of the frozen LTX weights
+  prompt: "A high quality video with smooth, natural motion."
+  negative_prompt: "worst quality, inconsistent motion, blurry, jittery, distorted"
+  gradient_checkpointing: true   # needed to backprop through the 13B transformer
+  vae_tiling: false
+
+data:
+  root: data/dataset
+  num_frames: 17                 # must be 8k+1 and <= the shortest clip (your clips have 24 frames)
+  height: 480                    # must be a multiple of 32
+  width: 864                     # must be a multiple of 32
+  num_workers: 0
+
+train:
+  batch_size: 1
+  grad_accum: 4
+  epochs: 10
+  lr: 1.0e-4                     # condition encoder + adapter MLP
+  scale_lr: 1.0e-3               # adapter gate starts at 0, so it needs a faster lr
+  weight_decay: 0.0
+  grad_clip: 1.0
+  save_dir: checkpoints
+  log_every: 1
+  save_every: 1                  # epochs
+  seed: 0
+  max_val_samples: 16            # val clips used for the per-epoch val loss
+
+inference:
+  steps: 30
+  guidance_scale: 1.0            # >1 enables classifier-free guidance on the text prompt
+  decode_timestep: 0.05
+  fps: 24
+  seed: 0
+
+# Applied by --tiny: a randomly initialised miniature LTX that runs on CPU in
+# seconds. Used to verify the whole pipeline without downloading 13B weights.
+tiny:
+  dtype: float32
+  num_frames: 17
+  height: 64
+  width: 96
+  epochs: 2
+  grad_accum: 1
+  steps: 4

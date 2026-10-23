@@ -2,6 +2,10 @@ numpy
 torch
 imageio[ffmpeg]
 Pillow
-diffusers
+pyyaml
+diffusers>=0.34
 transformers
 accelerate
+sentencepiece
+protobuf
+gradio

@@ -9,3 +9,6 @@ data/
 *.pkl
 
 .DS_Store
+
+checkpoints*/
+results/tiny/
