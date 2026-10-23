@@ -12,3 +12,11 @@ data/
 
 checkpoints*/
 results/tiny/
+
+# model weights / checkpoints
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+.gradio/
+results/app/
