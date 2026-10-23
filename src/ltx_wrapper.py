@@ -24,7 +24,8 @@ class LTXBackbone:
 
     Training follows LTX's flow-matching formulation:
         x_sigma = (1 - sigma) * x0 + sigma * noise
-        the transformer predicts (x0 - noise)   [the pipeline feeds -pred to the scheduler]
+        the transformer predicts the velocity (noise - x0)
+    (LTXConditionPipeline steps x += (sigma_next - sigma) * pred with per-token timesteps)
     The first latent frame is the clean conditioning image (timestep 0, no loss),
     exactly like LTXConditionPipeline's image-to-video mode.
     """
@@ -217,7 +218,7 @@ class LTXBackbone:
             self.video_coords(B, latent_shape),
         )
 
-        target = x0_tokens - noise
+        target = noise - x0_tokens
         err = ((pred - target) ** 2).mean(dim=-1)  # (B, S)
         w = (~keep).float()
         return (err * w).sum() / w.sum()
@@ -286,8 +287,8 @@ class LTXBackbone:
                 uncond = self._predict(inp, sig, keep, coords, negative=True)
                 pred = uncond + guidance_scale * (pred - uncond)
 
-            # pred = x0 - noise, so the flow velocity is -pred
-            x_new = x + (s_next - s) * (-pred)
+            # pred is the velocity (noise - x0); sigma decreases, so s_next - s < 0
+            x_new = x + (s_next - s) * pred
             x = torch.where(keep.unsqueeze(-1), x, x_new)
 
             if progress is not None:
