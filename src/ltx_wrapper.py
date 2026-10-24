@@ -60,6 +60,7 @@ class LTXBackbone:
             hidden_dim=tc.num_attention_heads * tc.attention_head_dim,
             inject_every=a.get("inject_every", 4),
             condition=a.get("condition", "points"),
+            relative=a.get("relative", False),
         ).to(self.device)
         self.motion.attach(self.transformer)
 

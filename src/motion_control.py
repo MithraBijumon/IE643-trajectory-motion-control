@@ -34,7 +34,8 @@ class MotionControl(nn.Module):
     These are the only trainable weights; LTX stays frozen.
     """
 
-    def __init__(self, dim=128, mode="input", num_blocks=0, hidden_dim=0, inject_every=4, condition="points"):
+    def __init__(self, dim=128, mode="input", num_blocks=0, hidden_dim=0, inject_every=4, condition="points",
+                 relative=False):
         super().__init__()
         if mode not in ("input", "multilayer"):
             raise ValueError(f"unknown adapter mode {mode}")
@@ -43,6 +44,7 @@ class MotionControl(nn.Module):
 
         self.mode = mode
         self.condition = condition
+        self.relative = relative  # multilayer: inject in units of the hidden state's own RMS
         self.condition_encoder = (
             ConditionEncoder() if condition == "points" else EntityConditionEncoder(in_channels=3 + dim)
         )
@@ -132,7 +134,12 @@ class MotionControl(nn.Module):
             def hook(module, args, output):
                 if self._ctx is None:
                     return output
-                return output + self._ctx[i].to(output.dtype)
+                r = self._ctx[i].to(output.dtype)
+                if self.relative:
+                    # the residual stream's scale is unknown and grows with depth; expressing the
+                    # injection relative to it makes a weight of ~0.1 mean "10% of the activations"
+                    r = r * output.detach().float().pow(2).mean(dim=(1, 2), keepdim=True).sqrt().to(output.dtype)
+                return output + r
             return hook
 
         self._handles = [
