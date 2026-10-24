@@ -13,6 +13,7 @@ adapter:
   mode: input                    # input = add once at the input; multilayer = ControlNet-style, every inject_every-th block
   inject_every: 4                # multilayer only: 48 blocks / 4 = 12 injection points
   relative: false                # multilayer: inject relative to the hidden-state RMS (try if cond_gain stays ~0)
+  entity_embedding: true         # entity condition: also paint the object's own latent feature (set false if the model memorises scenes)
   condition: points              # points = heatmap+flow of one point; entity = object-sized Gaussian + object feature (needs masks, see scripts/make_masks.py)
 
 data:
@@ -21,6 +22,7 @@ data:
   height: 480                    # must be a multiple of 32
   width: 864                     # must be a multiple of 32
   num_workers: 0
+  augment: true                  # train only: a random tracked point (tracks.npy) per visit + random mirror flip; fights overfitting on few scenes
   repeat: 1                      # train only: visits per clip per epoch (use ~8-10 for a few long videos like DAVIS)
 
 train:

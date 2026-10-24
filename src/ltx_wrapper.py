@@ -157,8 +157,7 @@ class LTXBackbone:
         video = self.vae.decode(z, timestep, return_dict=False)[0]
         return video_tensor_to_uint8(video)
 
-    @staticmethod
-    def entity_features(first_latent, mask, area):
+    def entity_features(self, first_latent, mask, area):
         """The controlled object as the network sees it.
 
         first_latent: (B, 128, H', W') normalized latent of the conditioning frame
@@ -170,6 +169,9 @@ class LTXBackbone:
         """
         w = F.adaptive_avg_pool2d(mask.float(), first_latent.shape[-2:])
         embedding = (w * first_latent).sum((2, 3)) / w.sum((2, 3)).clamp(min=1e-6)
+        if not self.cfg.get("adapter", {}).get("entity_embedding", True):
+            embedding = torch.zeros_like(embedding)
+
         return {"embedding": embedding, "radius": (area.float() / math.pi).sqrt()}
 
     def video_coords(self, batch, latent_shape, frame_rate=24):

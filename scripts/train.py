@@ -35,6 +35,7 @@ def make_loader(cfg, split, train):
         height=d["height"],
         width=d["width"],
         repeat=d.get("repeat", 1) if train else 1,
+        augment=bool(d.get("augment", False)) and train,
     )
     if not train and len(dataset) > cfg["train"]["max_val_samples"]:
         dataset = Subset(dataset, range(cfg["train"]["max_val_samples"]))
@@ -81,6 +82,8 @@ def main():
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--grad_accum", type=int, default=None)
     p.add_argument("--relative", action="store_true", help="multilayer: inject relative to the hidden-state RMS")
+    p.add_argument("--no_augment", action="store_true", help="disable random-track + mirror augmentation")
+    p.add_argument("--no_entity_embedding", action="store_true", help="entity condition without the per-object feature (footprint + flow only)")
     p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
     p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
     args = p.parse_args()
@@ -92,6 +95,10 @@ def main():
         cfg["train"]["save_dir"] = args.save_dir
     if args.repeat:
         cfg["data"]["repeat"] = args.repeat
+    if args.no_augment:
+        cfg["data"]["augment"] = False
+    if args.no_entity_embedding:
+        cfg["adapter"]["entity_embedding"] = False
     if args.lr:
         cfg["train"]["lr"] = args.lr
     if args.grad_accum:
@@ -114,7 +121,7 @@ def main():
     os.makedirs(t["save_dir"], exist_ok=True)
 
     print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: {cfg['adapter']['mode']} / {cfg['adapter'].get('condition', 'points')}"
-          f" | relative: {cfg['adapter'].get('relative', False)} | lr {cfg['train']['lr']} accum {cfg['train']['grad_accum']}")
+          f" | relative: {cfg['adapter'].get('relative', False)} | augment: {cfg['data'].get('augment', False)} | embedding: {cfg['adapter'].get('entity_embedding', True)} | lr {cfg['train']['lr']} accum {cfg['train']['grad_accum']}")
     print("Loading LTX...")
     backbone = LTXBackbone(cfg, device)
 

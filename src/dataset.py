@@ -22,7 +22,10 @@ class TrajectoryDataset(Dataset):
         width=None,
         default_radius=0.06,
         repeat=1,
+        augment=False,
     ):
+        # augment (train only): a random tracked point per visit (tracks.npy) and a random mirror flip
+        self.augment = augment
         self.repeat = repeat  # visit every clip this many times per epoch (each visit = a new random crop)
         self.default_radius = default_radius
         self.height = height
@@ -64,9 +67,27 @@ class TrajectoryDataset(Dataset):
 
         visibility_path = os.path.join(folder, "visibility.npy")
         if os.path.exists(visibility_path):
-            visible = np.load(visibility_path)[start:start + F]
+            full_visible = np.load(visibility_path)
+            visible = full_visible[start:start + F]
         else:
+            full_visible = np.ones(len(full_trajectory), dtype=bool)
             visible = np.ones(F, dtype=bool)
+
+        swapped = False
+        if self.augment:
+            pick = self.pick_track(folder, start, F)
+            if pick is not None:
+                full_trajectory, full_visible = pick
+                trajectory = full_trajectory[start:start + F]
+                visible = full_visible[start:start + F]
+                swapped = True
+
+        flip = self.augment and np.random.rand() < 0.5
+        if flip:
+            trajectory = trajectory.copy()
+            trajectory[:, 0] = 1.0 - trajectory[:, 0]
+            full_trajectory = full_trajectory.copy()
+            full_trajectory[:, 0] = 1.0 - full_trajectory[:, 0]
 
         item = {
             "name": name,
@@ -103,14 +124,46 @@ class TrajectoryDataset(Dataset):
             item["video"] = video
             item["image"] = video[0]
 
-            mask, area = self.load_mask(folder, full_trajectory, start, *video.shape[-2:])
+            mask, area = self.load_mask(
+                folder, full_trajectory, start, *video.shape[-2:], use_file=not swapped, flipped=flip
+            )
+
+            if flip:
+                video = video.flip(-1)
+                item["video"] = video
+                item["image"] = video[0]
+
             item["mask"] = torch.from_numpy(mask).float().unsqueeze(0)  # (1, H, W)
             item["mask_area"] = torch.tensor(area, dtype=torch.float32)
 
         return item
 
 
-    def load_mask(self, folder, full_trajectory, start, H, W):
+    def pick_track(self, folder, start, F, min_visible=0.8):
+        """A random tracked point of this clip for the crop [start, start+F), favouring moving ones.
+
+        Returns (trajectory, visibility) over the whole clip, or None when the clip has no
+        tracks.npy (then the stored trajectory is used).
+        """
+        tp = os.path.join(folder, "tracks.npy")
+        vp = os.path.join(folder, "tracks_visibility.npy")
+        if not (os.path.exists(tp) and os.path.exists(vp)):
+            return None
+
+        tracks, vis = np.load(tp), np.load(vp)  # (N, T, 2), (N, T)
+        window = slice(start, start + F)
+        # visible in most of the crop AND in its first frame (the conditioning image shows the object)
+        ok = np.where((vis[:, window].mean(1) >= min_visible) & vis[:, start])[0]
+        if len(ok) == 0:
+            return None
+
+        steps = np.linalg.norm(np.diff(tracks[ok][:, window], axis=1), axis=-1)
+        motion = (steps * (vis[ok][:, window][:, 1:] & vis[ok][:, window][:, :-1])).sum(1)
+        weights = motion + 0.02  # static points still get picked now and then
+        i = np.random.choice(ok, p=weights / weights.sum())
+        return tracks[i], vis[i]
+
+    def load_mask(self, folder, full_trajectory, start, H, W, use_file=True, flipped=False):
         """Mask of the controlled object at the conditioning frame, plus its area (fraction).
 
         mask.png (from scripts/make_masks.py) belongs to frame 0. The conditioning image is
@@ -119,13 +172,17 @@ class TrajectoryDataset(Dataset):
         """
         path = os.path.join(folder, "mask.png")
 
-        if os.path.exists(path):
+        if use_file and os.path.exists(path):
             mask = np.array(Image.open(path).convert("L").resize((W, H), Image.NEAREST)) > 127
+            if flipped:
+                mask = np.ascontiguousarray(mask[:, ::-1])  # full_trajectory is already mirrored; mask.png is not
         else:
             mask = np.zeros((H, W), dtype=bool)
 
         if mask.sum() == 0:
-            mask = disk_mask(H, W, full_trajectory[0], self.default_radius)
+            # no mask for this point: a disk centred where the object is in the conditioning frame
+            mask = disk_mask(H, W, full_trajectory[start], self.default_radius)
+            return mask, float(mask.mean())
 
         area = float(mask.mean())
 
