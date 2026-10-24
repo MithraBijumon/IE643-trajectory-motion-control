@@ -72,6 +72,7 @@ def main():
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--resume", default=None)
     p.add_argument("--variant", choices=["input", "multilayer"], default=None, help="adapter mode (overrides config)")
+    p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
     p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
     args = p.parse_args()
 
@@ -80,6 +81,8 @@ def main():
         cfg["data"]["root"] = args.data_root
     if args.save_dir:
         cfg["train"]["save_dir"] = args.save_dir
+    if args.repeat:
+        cfg["data"]["repeat"] = args.repeat
     if args.epochs:
         cfg["train"]["epochs"] = args.epochs
 

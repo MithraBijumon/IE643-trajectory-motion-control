@@ -114,6 +114,7 @@ def main():
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--variant", choices=["input", "multilayer"], default=None)
     p.add_argument("--condition", choices=["points", "entity"], default=None)
+    p.add_argument("--repeat", type=int, default=None)
     p.add_argument("--max_val", type=int, default=None, help="only generate/evaluate the first N val clips")
     args = p.parse_args()
 
@@ -160,6 +161,8 @@ def main():
             cmd += ["--variant", args.variant]
         if args.condition:
             cmd += ["--condition", args.condition]
+        if args.repeat:
+            cmd += ["--repeat", str(args.repeat)]
         sh(cmd)
 
     ckpt = os.path.join(ckpt_dir, "best.pt")
