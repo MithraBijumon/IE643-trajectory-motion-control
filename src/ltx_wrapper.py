@@ -221,7 +221,7 @@ class LTXBackbone:
     # Training
     # ------------------------------------------------------------------
 
-    def training_loss(self, batch, generator=None, use_condition=None):
+    def training_loss(self, batch, generator=None, use_condition=None, sigma=None):
         """use_condition: None = normal (with condition dropout), True/False = force the
         trajectory on/off for every sample (used to measure what the trajectory is worth)."""
         video = batch["video"].permute(0, 2, 1, 3, 4)  # B,F,3,H,W -> B,3,F,H,W
@@ -236,7 +236,9 @@ class LTXBackbone:
         noise = torch.randn(x0_tokens.shape, generator=generator, device=self.device)
 
         # logit-normal sigma sampling, as in LTX / SD3 flow-matching training
-        sigma = torch.sigmoid(torch.randn(B, 1, generator=generator, device=self.device))
+        drawn = torch.sigmoid(torch.randn(B, 1, generator=generator, device=self.device))
+        # `sigma` (a float in (0, 1)) pins the noise level, e.g. for a validation grid
+        sigma = drawn if sigma is None else torch.full_like(drawn, float(sigma))
         keep = self.first_frame_mask(B, latent_shape, self.device)
 
         noisy = (1 - sigma.unsqueeze(-1)) * x0_tokens + sigma.unsqueeze(-1) * noise

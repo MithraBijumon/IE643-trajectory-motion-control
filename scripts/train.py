@@ -49,25 +49,46 @@ def make_loader(cfg, split, train):
     return dataset, loader
 
 
+VAL_SIGMAS = (0.3, 0.6, 0.9)
+
+
 @torch.no_grad()
 def validate(backbone, loader, device, seed=1234):
-    """Val loss with the trajectory and without it, on identical noise and timesteps.
+    """Val loss with the trajectory and without it, on identical noise, over a grid of noise levels.
 
-    cond_gain = loss_without - loss_with. Clearly > 0 means the model uses the trajectory.
+    Motion is decided at high noise, and one random noise level per clip is too coarse to see a
+    small effect, so every clip is scored at each of VAL_SIGMAS. Returns
+        with / without : mean loss over clips and noise levels
+        gain_by_sigma  : {sigma: loss_without - loss_with}
+        gain_by_clip   : {clip name: loss_without - loss_with}   (one bad clip shows up here)
+    cond_gain = without - with; clearly > 0 means the model uses the trajectory.
     """
     backbone.motion.eval()
 
-    totals = {}
-    for name, use in (("with", True), ("without", False)):
+    # losses[mode][(clip, sigma)] = loss
+    losses = {True: {}, False: {}}
+    for use in (True, False):
         gen = torch.Generator(device=device).manual_seed(seed)
-        losses = []
         for batch in loader:
             batch["video"] = batch["video"].to(device)
-            losses.append(backbone.training_loss(batch, generator=gen, use_condition=use).item())
-        totals[name] = sum(losses) / max(len(losses), 1)
+            name = batch["name"][0]
+            for sg in VAL_SIGMAS:
+                losses[use][(name, sg)] = backbone.training_loss(
+                    batch, generator=gen, use_condition=use, sigma=sg
+                ).item()
 
     backbone.motion.train()
-    return totals["with"], totals["without"]
+
+    keys = list(losses[True])
+    mean = lambda d, ks: sum(d[k] for k in ks) / max(len(ks), 1)
+    gain = lambda ks: mean(losses[False], ks) - mean(losses[True], ks)
+
+    return {
+        "with": mean(losses[True], keys),
+        "without": mean(losses[False], keys),
+        "gain_by_sigma": {sg: gain([k for k in keys if k[1] == sg]) for sg in VAL_SIGMAS},
+        "gain_by_clip": {n: gain([k for k in keys if k[0] == n]) for n in dict.fromkeys(k[0] for k in keys)},
+    }
 
 
 def main():
@@ -192,8 +213,10 @@ def main():
 
         train_loss = running / max(n, 1)
         if len(val_set):
-            val_loss, val_loss_nocond = validate(backbone, val_loader, device)
+            v = validate(backbone, val_loader, device)
+            val_loss, val_loss_nocond = v["with"], v["without"]
         else:
+            v = {"gain_by_sigma": {}, "gain_by_clip": {}}
             val_loss = val_loss_nocond = float("nan")
 
         record = {
@@ -202,6 +225,8 @@ def main():
             "val_loss": val_loss,
             "val_loss_nocond": val_loss_nocond,
             "cond_gain": val_loss_nocond - val_loss,
+            "gain_by_sigma": {str(k): round(x, 5) for k, x in v["gain_by_sigma"].items()},
+            "gain_by_clip": {k: round(x, 5) for k, x in v["gain_by_clip"].items()},
             "adapter_scale": motion.gate_value(),
             "seconds": round(time.time() - t0, 1),
         }
