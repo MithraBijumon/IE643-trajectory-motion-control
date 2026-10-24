@@ -50,17 +50,23 @@ def make_loader(cfg, split, train):
 
 @torch.no_grad()
 def validate(backbone, loader, device, seed=1234):
-    """Mean loss over the val split with fixed noise/sigma, so epochs are comparable."""
-    backbone.motion.eval()
-    gen = torch.Generator(device=device).manual_seed(seed)
+    """Val loss with the trajectory and without it, on identical noise and timesteps.
 
-    losses = []
-    for batch in loader:
-        batch["video"] = batch["video"].to(device)
-        losses.append(backbone.training_loss(batch, generator=gen).item())
+    cond_gain = loss_without - loss_with. Clearly > 0 means the model uses the trajectory.
+    """
+    backbone.motion.eval()
+
+    totals = {}
+    for name, use in (("with", True), ("without", False)):
+        gen = torch.Generator(device=device).manual_seed(seed)
+        losses = []
+        for batch in loader:
+            batch["video"] = batch["video"].to(device)
+            losses.append(backbone.training_loss(batch, generator=gen, use_condition=use).item())
+        totals[name] = sum(losses) / max(len(losses), 1)
 
     backbone.motion.train()
-    return sum(losses) / max(len(losses), 1)
+    return totals["with"], totals["without"]
 
 
 def main():
@@ -168,12 +174,17 @@ def main():
                 )
 
         train_loss = running / max(n, 1)
-        val_loss = validate(backbone, val_loader, device) if len(val_set) else float("nan")
+        if len(val_set):
+            val_loss, val_loss_nocond = validate(backbone, val_loader, device)
+        else:
+            val_loss = val_loss_nocond = float("nan")
 
         record = {
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "val_loss": val_loss,
+            "val_loss_nocond": val_loss_nocond,
+            "cond_gain": val_loss_nocond - val_loss,
             "adapter_scale": motion.gate_value(),
             "seconds": round(time.time() - t0, 1),
         }

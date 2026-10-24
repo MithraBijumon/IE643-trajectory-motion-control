@@ -218,7 +218,9 @@ class LTXBackbone:
     # Training
     # ------------------------------------------------------------------
 
-    def training_loss(self, batch, generator=None):
+    def training_loss(self, batch, generator=None, use_condition=None):
+        """use_condition: None = normal (with condition dropout), True/False = force the
+        trajectory on/off for every sample (used to measure what the trajectory is worth)."""
         video = batch["video"].permute(0, 2, 1, 3, 4)  # B,F,3,H,W -> B,3,F,H,W
         trajectory = batch["trajectory"].to(self.device)
         visible = batch["visible"].to(self.device)
@@ -241,6 +243,8 @@ class LTXBackbone:
         # generation can later amplify its effect (motion guidance)
         p_drop = self.cfg["train"].get("cond_dropout", 0.0)
         cond_mask = (torch.rand(B, generator=generator, device=self.device) >= p_drop).float()
+        if use_condition is not None:
+            cond_mask = torch.full((B,), float(use_condition), device=self.device)
 
         entity = None
         if self.motion.condition == "entity":
