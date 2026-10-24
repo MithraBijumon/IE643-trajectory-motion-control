@@ -35,6 +35,38 @@ image-to-video), and writes both ATE numbers to `results/metrics.json`.
 
 All settings live in `configs/config.yaml`.
 
+## Adapter variants
+
+Set `adapter.mode` in `configs/config.yaml` (or `--variant` on `train.py` / `run_pipeline.py`):
+
+| mode | what it does | trainable |
+|---|---|---|
+| `input` | adds `scale * MLP(trajectory tokens)` once to the video tokens | ~1.2M |
+| `multilayer` | ControlNet-style: zero-initialised projections add the trajectory to the hidden states after every `inject_every`-th LTX block (forward hooks, LTX untouched) | ~7M |
+
+Checkpoints record their variant; every script reads it from the checkpoint, so you do not have to
+pass it again for inference.
+
+`train.cond_dropout` trains a fraction of samples without the trajectory. At inference,
+`--motion_guidance 2` (or the "Motion strength" slider) then amplifies the trajectory's effect:
+`v = v_without + g * (v_with - v_without)`. It costs one extra forward pass per step.
+
+## Benchmark and metrics
+
+```bash
+python scripts/benchmark.py --checkpoint checkpoints/best.pt --num_images 8 --out results/benchmark_input
+```
+
+Builds straight paths (left / right / up / down / diagonal) from each val image's object, generates
+videos with the adapter and a plain-LTX baseline, tracks them with CoTracker3 and reports, per method:
+
+- trajectory adherence: ATE, final-point error, direction cosine, progress (fraction of the intended distance travelled)
+- image preservation: CLIP similarity to the input image (plus LPIPS if `pip install lpips`)
+- temporal consistency: CLIP similarity between neighbouring frames
+
+Outputs: `results.json`, `summary.md` (table), `montage.png` (baseline vs adapter), overlay videos.
+Run it once per checkpoint/variant and compare the tables.
+
 ## Hardware
 
 The full model needs a large GPU (~26 GB of bf16 weights plus activations; use an A100/H100-class card).

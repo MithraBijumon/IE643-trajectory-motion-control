@@ -20,15 +20,40 @@ def unpack_latents(tokens, num_frames, height, width):
 
 
 class MotionControl(nn.Module):
-    """Trajectory -> condition tokens -> added onto the (noisy) LTX video tokens.
+    """Trajectory -> condition tokens -> injected into a frozen LTX transformer.
+
+    mode="input":      the condition is added once to the (noisy) video tokens.
+    mode="multilayer": zero-initialised projections add the condition to the hidden
+                       states after every `inject_every`-th transformer block
+                       (ControlNet / T2I-Adapter style, without copying the blocks).
 
     These are the only trainable weights; LTX stays frozen.
     """
 
-    def __init__(self, dim=128):
+    def __init__(self, dim=128, mode="input", num_blocks=0, hidden_dim=0, inject_every=4):
         super().__init__()
+        if mode not in ("input", "multilayer"):
+            raise ValueError(f"unknown adapter mode {mode}")
+
+        self.mode = mode
         self.condition_encoder = ConditionEncoder()
-        self.adapter = MotionAdapter(dim=dim)
+
+        if mode == "input":
+            self.adapter = MotionAdapter(dim=dim)
+        else:
+            self.block_ids = list(range(0, num_blocks, inject_every))
+            self.projs = nn.ModuleList()
+            for _ in self.block_ids:
+                proj = nn.Linear(dim, hidden_dim)
+                nn.init.zeros_(proj.weight)
+                nn.init.zeros_(proj.bias)
+                self.projs.append(proj)
+
+        self._ctx = None  # per-block residuals for the forward pass in flight
+
+    # ------------------------------------------------------------------
+    # Condition
+    # ------------------------------------------------------------------
 
     def condition_tokens(self, trajectory, visible, latent_shape):
         """
@@ -54,27 +79,85 @@ class MotionControl(nn.Module):
 
         return pack_latents(latent)
 
-    def residual(self, trajectory, visible, latent_shape, keep_mask=None):
-        """What the adapter adds to the video tokens; zero on tokens in keep_mask
-        (the clean conditioning image must stay exactly as encoded)."""
-        cond = self.condition_tokens(trajectory, visible, latent_shape)
-        out = self.adapter.scale * self.adapter.net(cond)
-
+    @staticmethod
+    def _gate(out, keep_mask, cond_mask):
+        """Zero the residual on the clean image tokens and on dropped-out samples."""
         if keep_mask is not None:
             out = out * (~keep_mask).unsqueeze(-1).to(out.dtype)
-
+        if cond_mask is not None:
+            out = out * cond_mask.view(-1, 1, 1).to(out.dtype)
         return out
 
-    def forward(self, video_tokens, trajectory, visible, latent_shape, keep_mask=None):
-        residual = self.residual(trajectory, visible, latent_shape, keep_mask)
-        return video_tokens.float() + residual
+    def residuals(self, trajectory, visible, latent_shape, keep_mask=None, cond_mask=None):
+        """What gets injected. A tensor for mode=input, a list (one per block) for multilayer.
+
+        keep_mask: (B, S) bool, True for tokens that must stay untouched (the image frame)
+        cond_mask: (B,) 1 = use the trajectory, 0 = drop it (condition dropout)
+        """
+        cond = self.condition_tokens(trajectory, visible, latent_shape)
+
+        if self.mode == "input":
+            out = self.adapter.scale * self.adapter.net(cond)
+            return self._gate(out, keep_mask, cond_mask)
+
+        return [self._gate(proj(cond), keep_mask, cond_mask) for proj in self.projs]
+
+    # ------------------------------------------------------------------
+    # Injection into LTX
+    # ------------------------------------------------------------------
+
+    def attach(self, transformer):
+        """Install forward hooks that add the stored residuals after the chosen blocks."""
+        if self.mode != "multilayer":
+            return
+
+        def make_hook(i):
+            def hook(module, args, output):
+                if self._ctx is None:
+                    return output
+                return output + self._ctx[i].to(output.dtype)
+            return hook
+
+        self._handles = [
+            transformer.transformer_blocks[b].register_forward_hook(make_hook(i))
+            for i, b in enumerate(self.block_ids)
+        ]
+
+    def set_context(self, residuals):
+        """Must stay set until backward() finishes: gradient checkpointing re-runs the
+        blocks (and these hooks) then. Call set_context(None) to switch injection off."""
+        self._ctx = residuals if self.mode == "multilayer" else None
+
+    def apply_input(self, video_tokens, residual):
+        """Token-space injection for mode=input; a no-op for multilayer."""
+        if self.mode == "input":
+            return video_tokens.float() + residual
+        return video_tokens.float()
+
+    # ------------------------------------------------------------------
+    # Logging / checkpoints
+    # ------------------------------------------------------------------
+
+    def gate_params(self):
+        return [self.adapter.scale] if self.mode == "input" else []
+
+    def gate_value(self):
+        """One number to watch in the training log."""
+        if self.mode == "input":
+            return self.adapter.scale.item()
+        return float(torch.stack([p.weight.abs().mean() for p in self.projs]).mean())
 
     def trainable_state(self):
-        return {
-            "condition_encoder": self.condition_encoder.state_dict(),
-            "adapter": self.adapter.state_dict(),
-        }
+        state = {"condition_encoder": self.condition_encoder.state_dict()}
+        if self.mode == "input":
+            state["adapter"] = self.adapter.state_dict()
+        else:
+            state["projs"] = self.projs.state_dict()
+        return state
 
     def load_trainable_state(self, state):
         self.condition_encoder.load_state_dict(state["condition_encoder"])
-        self.adapter.load_state_dict(state["adapter"])
+        if self.mode == "input":
+            self.adapter.load_state_dict(state["adapter"])
+        else:
+            self.projs.load_state_dict(state["projs"])

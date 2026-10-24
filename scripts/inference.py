@@ -23,6 +23,7 @@ import numpy as np
 
 from src.ltx_wrapper import LTXBackbone
 from src.utils import (
+    apply_checkpoint_cfg,
     get_device,
     load_config,
     load_image,
@@ -57,7 +58,8 @@ def load_sample(args, cfg):
     return image, trajectory, visible
 
 
-def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=None, guidance=None):
+def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=None, guidance=None,
+        motion_guidance=None, use_motion=True):
     inf = cfg["inference"]
     frames = backbone.generate(
         image,
@@ -67,6 +69,8 @@ def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=No
         guidance_scale=inf["guidance_scale"] if guidance is None else guidance,
         decode_timestep=inf["decode_timestep"],
         seed=inf["seed"] if seed is None else seed,
+        motion_guidance=inf["motion_guidance"] if motion_guidance is None else motion_guidance,
+        use_motion=use_motion,
     )
 
     save_video(frames, out_path, fps=inf["fps"])
@@ -87,12 +91,14 @@ def main():
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--guidance", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
+    p.add_argument("--motion_guidance", type=float, default=None, help=">1 amplifies the trajectory")
+    p.add_argument("--no_motion", action="store_true", help="run plain LTX image-to-video (baseline)")
     args = p.parse_args()
 
     if not args.sample_dir and not (args.image and args.trajectory):
         p.error("give --sample_dir, or both --image and --trajectory")
 
-    cfg = load_config(args.config, tiny=args.tiny)
+    cfg = apply_checkpoint_cfg(load_config(args.config, tiny=args.tiny), args.checkpoint)
     backbone = LTXBackbone(cfg, get_device())
 
     if args.checkpoint:
@@ -100,7 +106,8 @@ def main():
         print(f"Loaded {args.checkpoint}")
 
     image, trajectory, visible = load_sample(args, cfg)
-    run(backbone, cfg, image, trajectory, visible, args.out, args.seed, args.steps, args.guidance)
+    run(backbone, cfg, image, trajectory, visible, args.out, args.seed, args.steps, args.guidance,
+        args.motion_guidance, use_motion=not args.no_motion)
     print(f"Saved {args.out}")
 
 

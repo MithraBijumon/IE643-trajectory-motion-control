@@ -9,6 +9,10 @@ model:
   gradient_checkpointing: true   # needed to backprop through the 13B transformer
   vae_tiling: false
 
+adapter:
+  mode: input                    # input = add once at the input; multilayer = ControlNet-style, every inject_every-th block
+  inject_every: 4                # multilayer only: 48 blocks / 4 = 12 injection points
+
 data:
   root: data/dataset
   num_frames: 17                 # must be 8k+1 and <= the shortest clip (your clips have 24 frames)
@@ -28,12 +32,14 @@ train:
   log_every: 1
   save_every: 1                  # epochs
   seed: 0
+  cond_dropout: 0.1              # fraction of samples trained without the trajectory (enables motion_guidance)
   max_val_samples: 16            # val clips used for the per-epoch val loss
 
 inference:
   steps: 30
   guidance_scale: 1.0            # >1 enables classifier-free guidance on the text prompt
   decode_timestep: 0.05
+  motion_guidance: 1.0           # >1 amplifies the trajectory (e.g. 2-4); costs a second forward pass per step
   fps: 24
   seed: 0
 

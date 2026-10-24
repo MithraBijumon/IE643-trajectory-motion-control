@@ -16,14 +16,23 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from src.ltx_wrapper import LTXBackbone
-from src.utils import get_device, load_config, overlay_trajectory, save_video, smooth_trajectory
+from src.utils import (
+    DIRECTIONS,
+    apply_checkpoint_cfg,
+    get_device,
+    linear_path,
+    load_config,
+    overlay_trajectory,
+    save_video,
+    smooth_trajectory,
+)
 
 _state = {}
 
 
 def get_backbone():
     if "backbone" not in _state:
-        cfg = load_config(_state["config"], tiny=_state["tiny"])
+        cfg = apply_checkpoint_cfg(load_config(_state["config"], tiny=_state["tiny"]), _state["checkpoint"])
         backbone = LTXBackbone(cfg, get_device())
         if _state["checkpoint"]:
             backbone.load_checkpoint(_state["checkpoint"])
@@ -66,17 +75,25 @@ def on_clear(image_path):
     return [], image_path
 
 
-def generate(image_path, points, steps, seed, progress=gr.Progress()):
+PRESETS = ["Draw my own path"] + list(DIRECTIONS)
+
+
+def generate(image_path, points, preset, length, steps, seed, motion_guidance, progress=gr.Progress()):
     if image_path is None:
         raise gr.Error("Upload an image first.")
-    if len(points) < 2:
-        raise gr.Error("Click at least two points on the image to define a path.")
+    if preset == PRESETS[0] and len(points) < 2:
+        raise gr.Error("Click at least two points on the image, or pick a preset motion.")
 
     backbone, cfg = get_backbone()
     d = cfg["data"]
 
     image = Image.open(image_path).convert("RGB").resize((d["width"], d["height"]), Image.BICUBIC)
-    trajectory = smooth_trajectory(points, d["num_frames"])
+    if preset == PRESETS[0]:
+        trajectory = smooth_trajectory(points, d["num_frames"])
+    else:
+        # presets start at the first clicked point (put it on the object), default: centre
+        start = points[0] if points else [0.5, 0.5]
+        trajectory = linear_path(start, DIRECTIONS[preset], length, d["num_frames"])
 
     frames = backbone.generate(
         image,
@@ -85,6 +102,7 @@ def generate(image_path, points, steps, seed, progress=gr.Progress()):
         guidance_scale=cfg["inference"]["guidance_scale"],
         decode_timestep=cfg["inference"]["decode_timestep"],
         seed=int(seed),
+        motion_guidance=float(motion_guidance),
         progress=lambda f: progress(f, desc="Denoising"),
     )
 
@@ -100,7 +118,7 @@ def build_demo():
         gr.Markdown(
             "# Motion Controlled Video\n"
             "1. Upload a first-frame image. 2. Click along the path you want the subject to follow "
-            "(first click = start). 3. Generate."
+            "(first click = start), or pick a preset direction and click once on the subject. 3. Generate."
         )
         points = gr.State([])
         source = gr.State(None)
@@ -110,6 +128,9 @@ def build_demo():
                 upload = gr.Image(type="filepath", label="Upload image", sources=["upload"])
                 preview = gr.Image(label="Click to add trajectory points", interactive=False)
                 clear = gr.Button("Clear points")
+                preset = gr.Radio(PRESETS, value=PRESETS[0], label="Motion")
+                length = gr.Slider(0.1, 0.6, value=0.3, step=0.05, label="Preset path length (fraction of the frame)")
+                guidance = gr.Slider(1.0, 4.0, value=1.0, step=0.5, label="Motion strength (guidance)")
                 steps = gr.Slider(2, 50, value=30, step=1, label="Denoising steps")
                 seed = gr.Number(value=0, label="Seed", precision=0)
                 run = gr.Button("Generate video", variant="primary")
@@ -121,7 +142,7 @@ def build_demo():
         upload.change(on_image, upload, [points, preview])
         preview.select(on_click, [upload, points], [points, preview])
         clear.click(on_clear, upload, [points, preview])
-        run.click(generate, [upload, points, steps, seed], [video, overlay])
+        run.click(generate, [upload, points, preset, length, steps, seed, guidance], [video, overlay])
     return demo
 
 

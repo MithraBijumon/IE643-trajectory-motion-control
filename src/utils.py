@@ -31,6 +31,14 @@ def load_config(path=None, tiny=False):
     return cfg
 
 
+def apply_checkpoint_cfg(cfg, ckpt_path):
+    """Make cfg's adapter settings match the checkpoint that is about to be loaded."""
+    if ckpt_path:
+        saved = torch.load(ckpt_path, map_location="cpu", weights_only=False).get("cfg", {})
+        cfg["adapter"] = saved.get("adapter", {"mode": "input"})
+    return cfg
+
+
 def validate_config(cfg):
     d = cfg["data"]
     if (d["num_frames"] - 1) % 8 != 0:
@@ -81,6 +89,30 @@ def resample_trajectory(traj, num_frames, visible=None):
     # a resampled frame is visible only if its nearest source frame was
     nearest = np.clip(np.round(dst * (T - 1)).astype(int), 0, T - 1)
     return out.astype(np.float32), visible[nearest]
+
+
+DIRECTIONS = {
+    "left": (-1.0, 0.0),
+    "right": (1.0, 0.0),
+    "up": (0.0, -1.0),
+    "down": (0.0, 1.0),
+    "diag": (0.7071, 0.7071),  # down-right
+}
+
+
+def linear_path(start, direction, length, num_frames):
+    """Constant-speed straight path; the start is shifted if the path would leave the frame."""
+    d = np.asarray(direction, dtype=np.float32)
+    start = np.asarray(start, dtype=np.float32)
+    end = start + d * length
+
+    lo, hi = 0.05, 0.95
+    shift = np.where(end < lo, lo - end, 0) + np.where(end > hi, hi - end, 0)
+    start, end = start + shift, end + shift
+    start = np.clip(start, lo, hi)
+
+    t = np.linspace(0, 1, num_frames)[:, None]
+    return (start + (end - start) * t).astype(np.float32)
 
 
 def smooth_trajectory(points, num_frames):

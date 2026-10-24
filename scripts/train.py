@@ -21,7 +21,7 @@ from torch.utils.data import DataLoader, Subset
 
 from src.dataset import TrajectoryDataset
 from src.ltx_wrapper import LTXBackbone
-from src.utils import get_device, load_config, seed_everything
+from src.utils import apply_checkpoint_cfg, get_device, load_config, seed_everything
 
 
 def make_loader(cfg, split, train):
@@ -70,6 +70,7 @@ def main():
     p.add_argument("--save_dir", default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--resume", default=None)
+    p.add_argument("--variant", choices=["input", "multilayer"], default=None, help="adapter mode (overrides config)")
     args = p.parse_args()
 
     cfg = load_config(args.config, tiny=args.tiny)
@@ -80,12 +81,17 @@ def main():
     if args.epochs:
         cfg["train"]["epochs"] = args.epochs
 
+    if args.variant:
+        cfg["adapter"]["mode"] = args.variant
+    if args.resume:
+        apply_checkpoint_cfg(cfg, args.resume)
+
     t = cfg["train"]
     device = get_device()
     seed_everything(t["seed"])
     os.makedirs(t["save_dir"], exist_ok=True)
 
-    print(f"Device: {device} | tiny: {cfg['is_tiny']}")
+    print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: {cfg['adapter']['mode']}")
     print("Loading LTX...")
     backbone = LTXBackbone(cfg, device)
 
@@ -99,16 +105,14 @@ def main():
         )
 
     motion = backbone.motion
-    scale_params = [motion.adapter.scale]
-    other_params = [q for q in motion.parameters() if q is not motion.adapter.scale]
+    scale_params = motion.gate_params()
+    scale_ids = {id(q) for q in scale_params}
+    other_params = [q for q in motion.parameters() if id(q) not in scale_ids]
 
-    optimizer = torch.optim.AdamW(
-        [
-            {"params": other_params, "lr": t["lr"]},
-            {"params": scale_params, "lr": t["scale_lr"], "weight_decay": 0.0},
-        ],
-        weight_decay=t["weight_decay"],
-    )
+    groups = [{"params": other_params, "lr": t["lr"]}]
+    if scale_params:
+        groups.append({"params": scale_params, "lr": t["scale_lr"], "weight_decay": 0.0})
+    optimizer = torch.optim.AdamW(groups, weight_decay=t["weight_decay"])
 
     print(
         "Trainable parameters:",
@@ -121,7 +125,8 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         # load_state_dict restores the old lrs; re-apply the ones from the config
         optimizer.param_groups[0]["lr"] = t["lr"]
-        optimizer.param_groups[1]["lr"] = t["scale_lr"]
+        if len(optimizer.param_groups) > 1:
+            optimizer.param_groups[1]["lr"] = t["scale_lr"]
         start_epoch = ckpt["epoch"]
         best_val = ckpt.get("best_val", best_val)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
@@ -152,7 +157,7 @@ def main():
             if (step + 1) % t["log_every"] == 0:
                 print(
                     f"Epoch {epoch + 1}/{t['epochs']} step {step + 1}/{len(train_loader)} "
-                    f"loss {loss.item():.5f} scale {motion.adapter.scale.item():.5f}"
+                    f"loss {loss.item():.5f} gate {motion.gate_value():.5f}"
                 )
 
         train_loss = running / max(n, 1)
@@ -162,7 +167,7 @@ def main():
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "val_loss": val_loss,
-            "adapter_scale": motion.adapter.scale.item(),
+            "adapter_scale": motion.gate_value(),
             "seconds": round(time.time() - t0, 1),
         }
         print(json.dumps(record))

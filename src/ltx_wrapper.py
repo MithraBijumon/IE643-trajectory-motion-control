@@ -48,7 +48,16 @@ class LTXBackbone:
         if cfg["model"].get("vae_tiling"):
             self.vae.enable_tiling()
 
-        self.motion = MotionControl(dim=self.transformer.config.in_channels).to(self.device)
+        a = cfg.get("adapter", {})
+        tc = self.transformer.config
+        self.motion = MotionControl(
+            dim=tc.in_channels,
+            mode=a.get("mode", "input"),
+            num_blocks=len(self.transformer.transformer_blocks),
+            hidden_dim=tc.num_attention_heads * tc.attention_head_dim,
+            inject_every=a.get("inject_every", 4),
+        ).to(self.device)
+        self.motion.attach(self.transformer)
 
         self.register_latent_stats()
 
@@ -209,7 +218,18 @@ class LTXBackbone:
         noisy = (1 - sigma.unsqueeze(-1)) * x0_tokens + sigma.unsqueeze(-1) * noise
         noisy = torch.where(keep.unsqueeze(-1), x0_tokens, noisy)
 
-        adapted = self.motion(noisy, trajectory, visible, latent_shape, keep_mask=keep)
+        # condition dropout: some samples train without the trajectory so that
+        # generation can later amplify its effect (motion guidance)
+        p_drop = self.cfg["train"].get("cond_dropout", 0.0)
+        cond_mask = (torch.rand(B, generator=generator, device=self.device) >= p_drop).float()
+
+        res = self.motion.residuals(
+            trajectory, visible, latent_shape, keep_mask=keep, cond_mask=cond_mask
+        )
+        # multilayer hooks read this during forward AND during the checkpointed
+        # recompute in backward, so it is deliberately left set after this returns
+        self.motion.set_context(res)
+        adapted = self.motion.apply_input(noisy, res) if self.motion.mode == "input" else noisy
 
         pred = self._predict(
             adapted,
@@ -238,10 +258,14 @@ class LTXBackbone:
         decode_timestep=0.05,
         seed=0,
         progress=None,
+        motion_guidance=1.0,
+        use_motion=True,
     ):
         """
         image:      PIL image, already sized (width, height) = cfg data size
         trajectory: (F, 2) normalized, F = cfg num_frames
+        motion_guidance: >1 amplifies the trajectory's effect (needs cond_dropout in training)
+        use_motion: False runs plain LTX image-to-video (the baseline)
         Returns uint8 frames (F, H, W, 3).
         """
         d = self.cfg["data"]
@@ -269,7 +293,20 @@ class LTXBackbone:
 
         traj = torch.as_tensor(np.asarray(trajectory), dtype=torch.float32, device=self.device)[None]
         vis = torch.as_tensor(np.asarray(visible), dtype=torch.bool, device=self.device)[None]
-        cond = self.motion.residual(traj, vis, latent_shape, keep_mask=keep)
+        res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep)
+
+        def velocity(x, sig, motion_on):
+            if self.motion.mode == "input":
+                inp = x + res if motion_on else x
+            else:
+                self.motion.set_context(res if motion_on else None)
+                inp = x
+
+            pred = self._predict(inp, sig, keep, coords)
+            if guidance_scale > 1.0:
+                uncond = self._predict(inp, sig, keep, coords, negative=True)
+                pred = uncond + guidance_scale * (pred - uncond)
+            return pred
 
         x = torch.randn(1, S, img_latent.shape[-1], generator=gen, device=self.device)
         x[:, : img_latent.shape[1]] = img_latent
@@ -280,12 +317,10 @@ class LTXBackbone:
             s, s_next = sigmas[i], sigmas[i + 1]
             sig = torch.full((1, S), float(s), device=self.device)
 
-            inp = x + cond
-            pred = self._predict(inp, sig, keep, coords)
-
-            if guidance_scale > 1.0:
-                uncond = self._predict(inp, sig, keep, coords, negative=True)
-                pred = uncond + guidance_scale * (pred - uncond)
+            pred = velocity(x, sig, use_motion)
+            if use_motion and motion_guidance != 1.0:
+                off = velocity(x, sig, False)
+                pred = off + motion_guidance * (pred - off)
 
             # pred is the velocity (noise - x0); sigma decreases, so s_next - s < 0
             x_new = x + (s_next - s) * pred
@@ -294,6 +329,7 @@ class LTXBackbone:
             if progress is not None:
                 progress((i + 1) / steps)
 
+        self.motion.set_context(None)
         latents = unpack_latents(x, Fl, Hl, Wl)
         return self.decode_latents(latents, decode_timestep, generator=gen)[0]
 
@@ -306,5 +342,13 @@ class LTXBackbone:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
+        saved_mode = ckpt.get("cfg", {}).get("adapter", {}).get("mode", "input")
+        if saved_mode != self.motion.mode:
+            raise ValueError(
+                f"checkpoint was trained with adapter mode '{saved_mode}' but the model was built "
+                f"with '{self.motion.mode}'; pass the checkpoint through apply_checkpoint_cfg() first"
+            )
+
         self.motion.load_trainable_state(ckpt)
         return ckpt

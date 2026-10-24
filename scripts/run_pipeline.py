@@ -28,7 +28,7 @@ import numpy as np
 import torch
 
 from src.dataset import TrajectoryDataset  # noqa: F401  (fail early if the package is broken)
-from src.utils import get_device, load_config
+from src.utils import apply_checkpoint_cfg, get_device, load_config
 
 STAGES = ["preprocess", "index", "train", "generate", "evaluate"]
 
@@ -52,9 +52,9 @@ def stage_generate(args, cfg, ckpt, out_dir, base_dir):
     from inference import load_sample, run
     from src.ltx_wrapper import LTXBackbone
 
+    apply_checkpoint_cfg(cfg, ckpt)
     backbone = LTXBackbone(cfg, get_device())
     backbone.load_checkpoint(ckpt)
-    adapter = backbone.motion.adapter
 
     for name in val_samples(cfg["data"]["root"], limit):
         ns = argparse.Namespace(
@@ -66,10 +66,8 @@ def stage_generate(args, cfg, ckpt, out_dir, base_dir):
         run(backbone, cfg, image, trajectory, visible, os.path.join(out_dir, f"{name}.mp4"))
 
         print(f"[generate] {name}: baseline (adapter off)")
-        trained_scale = adapter.scale.data.clone()
-        adapter.scale.data.zero_()
-        run(backbone, cfg, image, trajectory, visible, os.path.join(base_dir, f"{name}.mp4"))
-        adapter.scale.data.copy_(trained_scale)
+        run(backbone, cfg, image, trajectory, visible, os.path.join(base_dir, f"{name}.mp4"),
+            use_motion=False)
 
     del backbone
     if torch.cuda.is_available():
@@ -114,6 +112,7 @@ def main():
     p.add_argument("--stages", default=",".join(STAGES))
     p.add_argument("--skip_eval", action="store_true", help="skip CoTracker evaluation (needs a download)")
     p.add_argument("--epochs", type=int, default=None)
+    p.add_argument("--variant", choices=["input", "multilayer"], default=None)
     p.add_argument("--max_val", type=int, default=None, help="only generate/evaluate the first N val clips")
     args = p.parse_args()
 
@@ -150,6 +149,8 @@ def main():
         cmd = [py, "scripts/train.py", *common, "--data_root", data_root, "--save_dir", ckpt_dir]
         if args.epochs:
             cmd += ["--epochs", str(args.epochs)]
+        if args.variant:
+            cmd += ["--variant", args.variant]
         sh(cmd)
 
     ckpt = os.path.join(ckpt_dir, "best.pt")
