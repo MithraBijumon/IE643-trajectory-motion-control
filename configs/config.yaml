@@ -20,6 +20,7 @@ data:
   height: 480                    # must be a multiple of 32
   width: 864                     # must be a multiple of 32
   num_workers: 0
+  repeat: 1                      # train only: visits per clip per epoch (use ~8-10 for a few long videos like DAVIS)
 
 train:
   batch_size: 1

@@ -34,6 +34,7 @@ def make_loader(cfg, split, train):
         load_video=True,
         height=d["height"],
         width=d["width"],
+        repeat=d.get("repeat", 1) if train else 1,
     )
     if not train and len(dataset) > cfg["train"]["max_val_samples"]:
         dataset = Subset(dataset, range(cfg["train"]["max_val_samples"]))

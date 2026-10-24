@@ -21,7 +21,9 @@ class TrajectoryDataset(Dataset):
         height=None,
         width=None,
         default_radius=0.06,
+        repeat=1,
     ):
+        self.repeat = repeat  # visit every clip this many times per epoch (each visit = a new random crop)
         self.default_radius = default_radius
         self.height = height
         self.width = width
@@ -45,10 +47,10 @@ class TrajectoryDataset(Dataset):
                 self.samples.append((name, folder, length))
 
     def __len__(self):
-        return len(self.samples)
+        return len(self.samples) * self.repeat
 
     def __getitem__(self, idx):
-        name, folder, length = self.samples[idx]
+        name, folder, length = self.samples[idx % len(self.samples)]
         F = self.num_frames
 
         start = (
