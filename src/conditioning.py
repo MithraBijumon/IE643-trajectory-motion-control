@@ -87,3 +87,58 @@ def rasterize_trajectories(
         ],
         dim=2,
     )
+
+def render_entity_condition(
+    trajectory,
+    visible,
+    embedding,
+    radius,
+    grid_height,
+    grid_width,
+    flow_scale=20.0,
+    min_sigma=0.75,
+):
+    """
+    Entity-aware condition rendered directly on the latent grid.
+
+    trajectory: (B, F, 2) normalized object centre per frame
+    visible:    (B, F)
+    embedding:  (B, C) feature of the object (masked mean of the image latent)
+    radius:     (B,) object radius as a fraction of sqrt(H*W)
+
+    The footprint is a Gaussian whose width follows the object size (DragAnything), so the
+    object occupies several latent cells instead of a sub-cell dot. The displacement to the
+    next frame is painted inside it (Tora-style), and the entity embedding is painted there
+    too so the network knows *what* is moving.
+
+    Returns (B, 3 + C, F, grid_height, grid_width): footprint, dx, dy, embedding * footprint.
+    """
+    traj = trajectory.float()
+    vis = visible.bool()
+    device = traj.device
+    B, Fn, _ = traj.shape
+
+    cx = traj[..., 0] * grid_width  # in latent cells (square cells, so distances are isotropic)
+    cy = traj[..., 1] * grid_height
+
+    radius_cells = radius.float() * (grid_height * grid_width) ** 0.5
+    sigma = (0.5 * radius_cells).clamp(min=min_sigma).view(B, 1, 1, 1)
+
+    xs = torch.arange(grid_width, device=device).float() + 0.5
+    ys = torch.arange(grid_height, device=device).float() + 0.5
+    d2 = (xs.view(1, 1, 1, -1) - cx[..., None, None]) ** 2 + (
+        ys.view(1, 1, -1, 1) - cy[..., None, None]
+    ) ** 2
+    footprint = torch.exp(-d2 / (2 * sigma**2)) * vis[..., None, None]  # (B, F, H, W)
+
+    disp = torch.zeros_like(traj)
+    disp[:, :-1] = traj[:, 1:] - traj[:, :-1]
+    valid = torch.zeros_like(vis)
+    valid[:, :-1] = vis[:, 1:] & vis[:, :-1]
+    disp = disp * valid.unsqueeze(-1) * flow_scale
+
+    dx = footprint * disp[..., 0, None, None]
+    dy = footprint * disp[..., 1, None, None]
+    entity = footprint[:, None] * embedding.float().view(B, -1, 1, 1, 1)  # (B, C, F, H, W)
+
+    return torch.cat([footprint[:, None], dx[:, None], dy[:, None], entity], dim=1)

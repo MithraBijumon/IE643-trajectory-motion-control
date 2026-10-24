@@ -8,7 +8,7 @@ End-to-end: preprocess -> index -> train -> generate -> evaluate.
     python scripts/run_pipeline.py --tiny --skip_eval      # CPU smoke test of every stage
     python scripts/run_pipeline.py --stages train,generate # run only some stages
 
-Stages: preprocess, index, train, generate, evaluate
+Stages: preprocess, index, masks, train, generate, evaluate  (masks only matter for --condition entity)
 Generation runs every val sample twice: with the trained adapter (results/adapter)
 and with the adapter switched off (results/baseline_ltx), which is plain
 image-to-video LTX. Evaluation reports ATE for both so the adapter's effect is explicit.
@@ -30,7 +30,7 @@ import torch
 from src.dataset import TrajectoryDataset  # noqa: F401  (fail early if the package is broken)
 from src.utils import apply_checkpoint_cfg, get_device, load_config
 
-STAGES = ["preprocess", "index", "train", "generate", "evaluate"]
+STAGES = ["preprocess", "index", "masks", "train", "generate", "evaluate"]
 
 
 def sh(cmd):
@@ -60,14 +60,14 @@ def stage_generate(args, cfg, ckpt, out_dir, base_dir):
         ns = argparse.Namespace(
             sample_dir=os.path.join(cfg["data"]["root"], "val", name), image=None, trajectory=None
         )
-        image, trajectory, visible = load_sample(ns, cfg)
+        image, trajectory, visible, mask = load_sample(ns, cfg)
 
         print(f"[generate] {name}: with adapter")
-        run(backbone, cfg, image, trajectory, visible, os.path.join(out_dir, f"{name}.mp4"))
+        run(backbone, cfg, image, trajectory, visible, os.path.join(out_dir, f"{name}.mp4"), mask=mask)
 
         print(f"[generate] {name}: baseline (adapter off)")
         run(backbone, cfg, image, trajectory, visible, os.path.join(base_dir, f"{name}.mp4"),
-            use_motion=False)
+            use_motion=False, mask=mask)
 
     del backbone
     if torch.cuda.is_available():
@@ -109,13 +109,17 @@ def main():
     p.add_argument("--data_root", default=None)
     p.add_argument("--ckpt_dir", default=None)
     p.add_argument("--results_dir", default=None)
-    p.add_argument("--stages", default=",".join(STAGES))
+    p.add_argument("--stages", default=None, help="comma list; default: all (masks only with --condition entity)")
     p.add_argument("--skip_eval", action="store_true", help="skip CoTracker evaluation (needs a download)")
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--variant", choices=["input", "multilayer"], default=None)
+    p.add_argument("--condition", choices=["points", "entity"], default=None)
     p.add_argument("--max_val", type=int, default=None, help="only generate/evaluate the first N val clips")
     args = p.parse_args()
 
+    if args.stages is None:
+        default = [s for s in STAGES if s != "masks" or args.condition == "entity"]
+        args.stages = ",".join(default)
     stages = [s for s in args.stages.split(",") if s]
     if args.skip_eval and "evaluate" in stages:
         stages.remove("evaluate")
@@ -145,12 +149,17 @@ def main():
     if "index" in stages:
         sh([py, "scripts/build_index.py", "--dataset_dir", data_root])
 
+    if "masks" in stages:
+        sh([py, "scripts/make_masks.py", "--data_root", data_root])
+
     if "train" in stages:
         cmd = [py, "scripts/train.py", *common, "--data_root", data_root, "--save_dir", ckpt_dir]
         if args.epochs:
             cmd += ["--epochs", str(args.epochs)]
         if args.variant:
             cmd += ["--variant", args.variant]
+        if args.condition:
+            cmd += ["--condition", args.condition]
         sh(cmd)
 
     ckpt = os.path.join(ckpt_dir, "best.pt")

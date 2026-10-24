@@ -71,6 +71,7 @@ def main():
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--resume", default=None)
     p.add_argument("--variant", choices=["input", "multilayer"], default=None, help="adapter mode (overrides config)")
+    p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
     args = p.parse_args()
 
     cfg = load_config(args.config, tiny=args.tiny)
@@ -83,6 +84,8 @@ def main():
 
     if args.variant:
         cfg["adapter"]["mode"] = args.variant
+    if args.condition:
+        cfg["adapter"]["condition"] = args.condition
     if args.resume:
         apply_checkpoint_cfg(cfg, args.resume)
 
@@ -91,7 +94,7 @@ def main():
     seed_everything(t["seed"])
     os.makedirs(t["save_dir"], exist_ok=True)
 
-    print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: {cfg['adapter']['mode']}")
+    print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: {cfg['adapter']['mode']} / {cfg['adapter'].get('condition', 'points')}")
     print("Loading LTX...")
     backbone = LTXBackbone(cfg, device)
 

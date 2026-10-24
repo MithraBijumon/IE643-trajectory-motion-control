@@ -3,8 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.adapter import MotionAdapter
-from src.condition_encoder import ConditionEncoder
-from src.conditioning import rasterize_trajectories
+from src.condition_encoder import ConditionEncoder, EntityConditionEncoder
+from src.conditioning import rasterize_trajectories, render_entity_condition
 
 
 def pack_latents(latents):
@@ -27,16 +27,25 @@ class MotionControl(nn.Module):
                        states after every `inject_every`-th transformer block
                        (ControlNet / T2I-Adapter style, without copying the blocks).
 
+    condition="points":  heatmap + dx + dy of the tracked point, rasterized in pixel space.
+    condition="entity":  object-sized Gaussian footprint + displacement + the object's own
+                         feature (masked mean of the image latent), built on the latent grid.
+
     These are the only trainable weights; LTX stays frozen.
     """
 
-    def __init__(self, dim=128, mode="input", num_blocks=0, hidden_dim=0, inject_every=4):
+    def __init__(self, dim=128, mode="input", num_blocks=0, hidden_dim=0, inject_every=4, condition="points"):
         super().__init__()
         if mode not in ("input", "multilayer"):
             raise ValueError(f"unknown adapter mode {mode}")
+        if condition not in ("points", "entity"):
+            raise ValueError(f"unknown condition type {condition}")
 
         self.mode = mode
-        self.condition_encoder = ConditionEncoder()
+        self.condition = condition
+        self.condition_encoder = (
+            ConditionEncoder() if condition == "points" else EntityConditionEncoder(in_channels=3 + dim)
+        )
 
         if mode == "input":
             self.adapter = MotionAdapter(dim=dim)
@@ -55,20 +64,28 @@ class MotionControl(nn.Module):
     # Condition
     # ------------------------------------------------------------------
 
-    def condition_tokens(self, trajectory, visible, latent_shape):
+    def condition_tokens(self, trajectory, visible, latent_shape, entity=None):
         """
         trajectory: (B, F, 2) normalized, visible: (B, F)
         latent_shape: (F', H', W') of the video latent grid
+        entity: {"embedding": (B, 128), "radius": (B,)}, required for condition="entity"
 
         Returns (B, F'*H'*W', 128) float32 tokens.
         """
         Fl, Hl, Wl = latent_shape
 
-        # rasterize at exactly 32x the latent grid so the encoder lands on it
-        condition = rasterize_trajectories(
-            trajectory.float(), visible, height=Hl * 32, width=Wl * 32
-        )
-        condition = condition.permute(0, 2, 1, 3, 4).float()  # B,3,F,H,W
+        if self.condition == "entity":
+            if entity is None:
+                raise ValueError("condition='entity' needs entity={'embedding', 'radius'}")
+            condition = render_entity_condition(
+                trajectory, visible, entity["embedding"], entity["radius"], Hl, Wl
+            )
+        else:
+            # rasterize at exactly 32x the latent grid so the encoder lands on it
+            condition = rasterize_trajectories(
+                trajectory.float(), visible, height=Hl * 32, width=Wl * 32
+            )
+            condition = condition.permute(0, 2, 1, 3, 4).float()  # B,3,F,H,W
 
         latent = self.condition_encoder(condition)
 
@@ -88,13 +105,13 @@ class MotionControl(nn.Module):
             out = out * cond_mask.view(-1, 1, 1).to(out.dtype)
         return out
 
-    def residuals(self, trajectory, visible, latent_shape, keep_mask=None, cond_mask=None):
+    def residuals(self, trajectory, visible, latent_shape, keep_mask=None, cond_mask=None, entity=None):
         """What gets injected. A tensor for mode=input, a list (one per block) for multilayer.
 
         keep_mask: (B, S) bool, True for tokens that must stay untouched (the image frame)
         cond_mask: (B,) 1 = use the trajectory, 0 = drop it (condition dropout)
         """
-        cond = self.condition_tokens(trajectory, visible, latent_shape)
+        cond = self.condition_tokens(trajectory, visible, latent_shape, entity)
 
         if self.mode == "input":
             out = self.adapter.scale * self.adapter.net(cond)

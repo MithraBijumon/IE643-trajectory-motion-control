@@ -20,6 +20,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
+from PIL import Image
 
 from src.ltx_wrapper import LTXBackbone
 from src.utils import (
@@ -42,6 +43,7 @@ def load_sample(args, cfg):
         vis_path = os.path.join(args.sample_dir, "visibility.npy")
     else:
         image_path, traj_path, vis_path = args.image, args.trajectory, None
+    mask_path = os.path.join(args.sample_dir, "mask.png") if args.sample_dir else getattr(args, "mask", None)
 
     image = load_image(image_path, d["height"], d["width"])
     trajectory = np.load(traj_path)
@@ -55,11 +57,15 @@ def load_sample(args, cfg):
     else:
         trajectory, visible = resample_trajectory(trajectory, nF, visible)
 
-    return image, trajectory, visible
+    mask = None
+    if mask_path and os.path.exists(mask_path):
+        mask = np.array(Image.open(mask_path).convert("L").resize((d["width"], d["height"]), Image.NEAREST)) > 127
+
+    return image, trajectory, visible, mask
 
 
 def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=None, guidance=None,
-        motion_guidance=None, use_motion=True):
+        motion_guidance=None, use_motion=True, mask=None):
     inf = cfg["inference"]
     frames = backbone.generate(
         image,
@@ -71,6 +77,7 @@ def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=No
         seed=inf["seed"] if seed is None else seed,
         motion_guidance=inf["motion_guidance"] if motion_guidance is None else motion_guidance,
         use_motion=use_motion,
+        mask=mask,
     )
 
     save_video(frames, out_path, fps=inf["fps"])
@@ -87,6 +94,7 @@ def main():
     p.add_argument("--sample_dir", default=None)
     p.add_argument("--image", default=None)
     p.add_argument("--trajectory", default=None)
+    p.add_argument("--mask", default=None, help="object mask png for --image (condition=entity); optional")
     p.add_argument("--out", default="results/adapter/generated.mp4")
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--guidance", type=float, default=None)
@@ -105,9 +113,9 @@ def main():
         backbone.load_checkpoint(args.checkpoint)
         print(f"Loaded {args.checkpoint}")
 
-    image, trajectory, visible = load_sample(args, cfg)
+    image, trajectory, visible, mask = load_sample(args, cfg)
     run(backbone, cfg, image, trajectory, visible, args.out, args.seed, args.steps, args.guidance,
-        args.motion_guidance, use_motion=not args.no_motion)
+        args.motion_guidance, use_motion=not args.no_motion, mask=mask)
     print(f"Saved {args.out}")
 
 

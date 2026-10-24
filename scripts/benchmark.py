@@ -48,8 +48,14 @@ def val_items(data_root, num_images, cfg):
         folder = os.path.join(split, name)
         if not os.path.exists(os.path.join(folder, "trajectory.npy")):
             continue
+        mask_path = os.path.join(folder, "mask.png")
+        mask = None
+        if os.path.exists(mask_path):
+            mask = np.array(Image.open(mask_path).convert("L").resize((d["width"], d["height"]), Image.NEAREST)) > 127
+
         items.append(
             {
+                "mask": mask,
                 "name": name,
                 "image": load_image(os.path.join(folder, "image.png"), d["height"], d["width"]),
                 "start": np.load(os.path.join(folder, "trajectory.npy"))[0],
@@ -128,7 +134,7 @@ def main():
     quality = VideoQuality(device)
 
     items = val_items(data_root, args.num_images, cfg)
-    print(f"{len(items)} images x {len(motions)} motions | adapter: {cfg['adapter']['mode']} | motion_guidance {mg}")
+    print(f"{len(items)} images x {len(motions)} motions | adapter: {cfg['adapter']['mode']}/{cfg['adapter'].get('condition', 'points')} | motion_guidance {mg}")
 
     H, W = cfg["data"]["height"], cfg["data"]["width"]
     scale = np.array([W, H], dtype=np.float32)
@@ -136,7 +142,7 @@ def main():
     records = {"adapter": [], "baseline": []}
     montage_rows, montage_labels = [], []
 
-    def generate(image, target, use_motion):
+    def generate(image, target, use_motion, mask=None):
         return backbone.generate(
             image,
             target,
@@ -146,6 +152,7 @@ def main():
             seed=args.seed,
             motion_guidance=mg,
             use_motion=use_motion,
+            mask=mask,
         )
 
     for item in items:
@@ -154,7 +161,7 @@ def main():
 
         # one baseline video per image; it is scored against every target path
         first_target = linear_path(item["start"], DIRECTIONS[motions[0]], args.length, nF)
-        base_frames = generate(image, first_target, use_motion=False)
+        base_frames = generate(image, first_target, use_motion=False, mask=item["mask"])
         save_video(base_frames, os.path.join(args.out, "baseline", f"{name}.mp4"), fps=inf["fps"])
         base_track = track_point(cotracker, base_frames, first_target[0] * scale, device)
         base_q = quality.score(img_np, base_frames)
@@ -163,7 +170,7 @@ def main():
             target = linear_path(item["start"], DIRECTIONS[motion], args.length, nF)
             tag = f"{name}_{motion}"
 
-            frames = generate(image, target, use_motion=True)
+            frames = generate(image, target, use_motion=True, mask=item["mask"])
             save_video(
                 overlay_trajectory(frames, target),
                 os.path.join(args.out, "adapter", f"{tag}.mp4"),

@@ -40,6 +40,21 @@ def get_backbone():
     return _state["backbone"], _state["cfg"]
 
 
+def get_mask(image, start_norm):
+    """Object mask for the first click (SAM), or None to fall back to a disk."""
+    try:
+        if "sam" not in _state:
+            from src.segmentation import SamSegmenter
+
+            _state["sam"] = SamSegmenter(get_device())
+        W, H = image.size
+        mask, _ = _state["sam"].segment(image, (start_norm[0] * W, start_norm[1] * H))
+        return mask
+    except Exception as e:  # SAM weights unavailable, etc.
+        print(f"Segmentation failed ({e}); using a disk around the point instead.")
+        return None
+
+
 def draw_points(image, points):
     """Preview: clicked points joined by the smoothed path."""
     img = Image.open(image).convert("RGB") if isinstance(image, str) else image.copy()
@@ -95,9 +110,18 @@ def generate(image_path, points, preset, length, steps, seed, motion_guidance, p
         start = points[0] if points else [0.5, 0.5]
         trajectory = linear_path(start, DIRECTIONS[preset], length, d["num_frames"])
 
+    mask, mask_view = None, None
+    if backbone.motion.condition == "entity":
+        mask = get_mask(image, trajectory[0])
+        if mask is not None:
+            shown = np.array(image).astype(np.float32)
+            shown[mask] = 0.5 * shown[mask] + 0.5 * np.array([255, 40, 40], dtype=np.float32)
+            mask_view = Image.fromarray(shown.astype(np.uint8))
+
     frames = backbone.generate(
         image,
         trajectory,
+        mask=mask,
         steps=int(steps),
         guidance_scale=cfg["inference"]["guidance_scale"],
         decode_timestep=cfg["inference"]["decode_timestep"],
@@ -110,7 +134,7 @@ def generate(image_path, points, preset, length, steps, seed, motion_guidance, p
     over = os.path.join("results", "app", "generated_overlay.mp4")
     save_video(frames, out, fps=cfg["inference"]["fps"])
     save_video(overlay_trajectory(frames, trajectory), over, fps=cfg["inference"]["fps"])
-    return out, over
+    return out, over, mask_view
 
 
 def build_demo():
@@ -138,11 +162,12 @@ def build_demo():
             with gr.Column():
                 video = gr.Video(label="Generated video")
                 overlay = gr.Video(label="With target trajectory overlay")
+                mask_img = gr.Image(label="Detected object (entity condition only)", interactive=False)
 
         upload.change(on_image, upload, [points, preview])
         preview.select(on_click, [upload, points], [points, preview])
         clear.click(on_clear, upload, [points, preview])
-        run.click(generate, [upload, points, preset, length, steps, seed, guidance], [video, overlay])
+        run.click(generate, [upload, points, preset, length, steps, seed, guidance], [video, overlay, mask_img])
     return demo
 
 

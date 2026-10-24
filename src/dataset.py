@@ -4,7 +4,10 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 import torch.nn.functional as F_nn
+from PIL import Image
 from torch.utils.data import Dataset
+
+from src.segmentation import disk_mask
 
 
 class TrajectoryDataset(Dataset):
@@ -17,7 +20,9 @@ class TrajectoryDataset(Dataset):
         load_video=True,
         height=None,
         width=None,
+        default_radius=0.06,
     ):
+        self.default_radius = default_radius
         self.height = height
         self.width = width
         self.num_frames = num_frames
@@ -52,9 +57,8 @@ class TrajectoryDataset(Dataset):
             else 0
         )
 
-        trajectory = np.load(
-            os.path.join(folder, "trajectory.npy")
-        )[start:start + F]
+        full_trajectory = np.load(os.path.join(folder, "trajectory.npy"))
+        trajectory = full_trajectory[start:start + F]
 
         visibility_path = os.path.join(folder, "visibility.npy")
         if os.path.exists(visibility_path):
@@ -97,7 +101,49 @@ class TrajectoryDataset(Dataset):
             item["video"] = video
             item["image"] = video[0]
 
+            mask, area = self.load_mask(folder, full_trajectory, start, *video.shape[-2:])
+            item["mask"] = torch.from_numpy(mask).float().unsqueeze(0)  # (1, H, W)
+            item["mask_area"] = torch.tensor(area, dtype=torch.float32)
+
         return item
+
+
+    def load_mask(self, folder, full_trajectory, start, H, W):
+        """Mask of the controlled object at the conditioning frame, plus its area (fraction).
+
+        mask.png (from scripts/make_masks.py) belongs to frame 0. The conditioning image is
+        frame `start`, so the mask is moved by the object's displacement (an approximation: the
+        shape is kept). Without a mask file a disk around the tracked point is used.
+        """
+        path = os.path.join(folder, "mask.png")
+
+        if os.path.exists(path):
+            mask = np.array(Image.open(path).convert("L").resize((W, H), Image.NEAREST)) > 127
+        else:
+            mask = np.zeros((H, W), dtype=bool)
+
+        if mask.sum() == 0:
+            mask = disk_mask(H, W, full_trajectory[0], self.default_radius)
+
+        area = float(mask.mean())
+
+        if start > 0:
+            shift = (full_trajectory[start] - full_trajectory[0]) * np.array([W, H])
+            mask = shift_mask(mask, int(round(shift[0])), int(round(shift[1])))
+
+        return mask, area
+
+
+def shift_mask(mask, dx, dy):
+    """Translate a boolean mask by (dx, dy) pixels, filling with False."""
+    H, W = mask.shape
+    out = np.zeros_like(mask)
+    if abs(dx) >= W or abs(dy) >= H:
+        return out
+    out[max(dy, 0):H + min(dy, 0), max(dx, 0):W + min(dx, 0)] = mask[
+        max(-dy, 0):H + min(-dy, 0), max(-dx, 0):W + min(-dx, 0)
+    ]
+    return out
 
 
 def read_video(path, start, num_frames):

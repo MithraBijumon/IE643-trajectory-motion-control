@@ -47,6 +47,30 @@ Set `adapter.mode` in `configs/config.yaml` (or `--variant` on `train.py` / `run
 Checkpoints record their variant; every script reads it from the checkpoint, so you do not have to
 pass it again for inference.
 
+## Condition types
+
+`adapter.condition` (or `--condition`) picks what the trajectory looks like to the network:
+
+| condition | representation |
+|---|---|
+| `points` | heatmap + dx + dy of one tracked point, rasterized at pixel resolution (Gaussian sigma 0.03 of the frame) |
+| `entity` | DragAnything/Tora-inspired: an **object-sized Gaussian footprint** (radius from the object's mask area), the displacement to the next frame painted inside it, and the **object's own feature** (mean of the first-frame LTX latent inside its mask) painted there too. Built directly on the latent grid. |
+
+Why: with `points`, one latent cell covers 32 px but the Gaussian is ~14 px wide, so after pooling to
+the latent grid the point is a single cell with a peak of ~0.5. `entity` gives the object a spatial
+footprint of several cells and says which object it is.
+
+Masks come from SAM prompted with the tracked point (`scripts/make_masks.py`, writes `mask.png` per
+sample plus a contact sheet `masks_preview.jpg` to check by eye; picks SAM's largest candidate = whole
+object). Without a `mask.png` a disk around the point is used. The mask belongs to frame 0, so for a
+random crop starting at frame s it is shifted by the object's displacement (an approximation).
+The app segments the first click with SAM when the loaded checkpoint is an `entity` one.
+
+```bash
+python scripts/make_masks.py --data_root data/dataset      # once, ~1-2 min
+python scripts/train.py --variant multilayer --condition entity
+```
+
 `train.cond_dropout` trains a fraction of samples without the trajectory. At inference,
 `--motion_guidance 2` (or the "Motion strength" slider) then amplifies the trajectory's effect:
 `v = v_without + g * (v_with - v_without)`. It costs one extra forward pass per step.

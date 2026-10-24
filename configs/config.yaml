@@ -12,6 +12,7 @@ model:
 adapter:
   mode: input                    # input = add once at the input; multilayer = ControlNet-style, every inject_every-th block
   inject_every: 4                # multilayer only: 48 blocks / 4 = 12 injection points
+  condition: points              # points = heatmap+flow of one point; entity = object-sized Gaussian + object feature (needs masks, see scripts/make_masks.py)
 
 data:
   root: data/dataset

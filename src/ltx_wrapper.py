@@ -1,9 +1,12 @@
+import math
+
 import numpy as np
 import torch
 import torch.nn.functional as F
 from PIL import Image
 
 from src.motion_control import MotionControl, pack_latents, unpack_latents
+from src.segmentation import disk_mask
 from src.utils import torch_dtype, video_tensor_to_uint8
 
 VAE_SPATIAL = 32
@@ -56,6 +59,7 @@ class LTXBackbone:
             num_blocks=len(self.transformer.transformer_blocks),
             hidden_dim=tc.num_attention_heads * tc.attention_head_dim,
             inject_every=a.get("inject_every", 4),
+            condition=a.get("condition", "points"),
         ).to(self.device)
         self.motion.attach(self.transformer)
 
@@ -152,6 +156,21 @@ class LTXBackbone:
         video = self.vae.decode(z, timestep, return_dict=False)[0]
         return video_tensor_to_uint8(video)
 
+    @staticmethod
+    def entity_features(first_latent, mask, area):
+        """The controlled object as the network sees it.
+
+        first_latent: (B, 128, H', W') normalized latent of the conditioning frame
+        mask:         (B, 1, H, W) float, the object in that frame
+        area:         (B,) object area as a fraction of the frame
+
+        embedding = mean of the image latent inside the mask; radius is that of a disk with
+        the same area, as a fraction of sqrt(H*W).
+        """
+        w = F.adaptive_avg_pool2d(mask.float(), first_latent.shape[-2:])
+        embedding = (w * first_latent).sum((2, 3)) / w.sum((2, 3)).clamp(min=1e-6)
+        return {"embedding": embedding, "radius": (area.float() / math.pi).sqrt()}
+
     def video_coords(self, batch, latent_shape, frame_rate=24):
         """Rotary position coordinates, same construction as LTXConditionPipeline."""
         Fl, Hl, Wl = latent_shape
@@ -223,8 +242,14 @@ class LTXBackbone:
         p_drop = self.cfg["train"].get("cond_dropout", 0.0)
         cond_mask = (torch.rand(B, generator=generator, device=self.device) >= p_drop).float()
 
+        entity = None
+        if self.motion.condition == "entity":
+            entity = self.entity_features(
+                x0[:, :, 0], batch["mask"].to(self.device), batch["mask_area"].to(self.device)
+            )
+
         res = self.motion.residuals(
-            trajectory, visible, latent_shape, keep_mask=keep, cond_mask=cond_mask
+            trajectory, visible, latent_shape, keep_mask=keep, cond_mask=cond_mask, entity=entity
         )
         # multilayer hooks read this during forward AND during the checkpointed
         # recompute in backward, so it is deliberately left set after this returns
@@ -260,12 +285,15 @@ class LTXBackbone:
         progress=None,
         motion_guidance=1.0,
         use_motion=True,
+        mask=None,
     ):
         """
         image:      PIL image, already sized (width, height) = cfg data size
         trajectory: (F, 2) normalized, F = cfg num_frames
         motion_guidance: >1 amplifies the trajectory's effect (needs cond_dropout in training)
         use_motion: False runs plain LTX image-to-video (the baseline)
+        mask: (H, W) bool mask of the controlled object in `image` (adapter condition="entity");
+              a disk around the first trajectory point is used when it is missing
         Returns uint8 frames (F, H, W, 3).
         """
         d = self.cfg["data"]
@@ -293,7 +321,18 @@ class LTXBackbone:
 
         traj = torch.as_tensor(np.asarray(trajectory), dtype=torch.float32, device=self.device)[None]
         vis = torch.as_tensor(np.asarray(visible), dtype=torch.bool, device=self.device)[None]
-        res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep)
+        entity = None
+        if self.motion.condition == "entity":
+            if mask is None:
+                mask = disk_mask(H, W, np.asarray(trajectory)[0], 0.06)
+            elif mask.shape != (H, W):
+                mask = np.array(Image.fromarray(mask.astype(np.uint8) * 255).resize((W, H), Image.NEAREST)) > 127
+
+            mask_t = torch.from_numpy(mask).float().to(self.device)[None, None]
+            image_latent = unpack_latents(img_latent, 1, Hl, Wl)[:, :, 0]
+            entity = self.entity_features(image_latent, mask_t, mask_t.mean().view(1))
+
+        res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep, entity=entity)
 
         def velocity(x, sig, motion_on):
             if self.motion.mode == "input":
@@ -343,11 +382,13 @@ class LTXBackbone:
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
-        saved_mode = ckpt.get("cfg", {}).get("adapter", {}).get("mode", "input")
-        if saved_mode != self.motion.mode:
+        saved = ckpt.get("cfg", {}).get("adapter", {})
+        saved_kind = (saved.get("mode", "input"), saved.get("condition", "points"))
+        if saved_kind != (self.motion.mode, self.motion.condition):
             raise ValueError(
-                f"checkpoint was trained with adapter mode '{saved_mode}' but the model was built "
-                f"with '{self.motion.mode}'; pass the checkpoint through apply_checkpoint_cfg() first"
+                f"checkpoint was trained with adapter {saved_kind} but the model was built with "
+                f"{(self.motion.mode, self.motion.condition)}; pass the checkpoint through "
+                "apply_checkpoint_cfg() first"
             )
 
         self.motion.load_trainable_state(ckpt)
