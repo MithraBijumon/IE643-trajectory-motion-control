@@ -75,18 +75,20 @@ def stage_generate(args, cfg, ckpt, out_dir, base_dir):
 
 
 def stage_evaluate(cfg, out_dir, base_dir, metrics_path, limit=None):
-    from evaluate import evaluate_one, load_cotracker
+    from evaluate import evaluate_one, load_clip, load_cotracker
 
     device = get_device()
     cotracker = load_cotracker(device)
+    clip_bundle = load_clip(device)
     results = {}
 
     for name in val_samples(cfg["data"]["root"], limit):
         traj = os.path.join(cfg["data"]["root"], "val", name, "trajectory.npy")
         row = {}
         for label, folder in (("adapter", out_dir), ("baseline", base_dir)):
-            ate, _, _ = evaluate_one(os.path.join(folder, f"{name}.mp4"), traj, cotracker, device)
-            row[label] = ate
+            row[label] = evaluate_one(
+                os.path.join(folder, f"{name}.mp4"), traj, None, cotracker, clip_bundle, device
+            )["ate"]
         results[name] = row
         print(f"[evaluate] {name}: ATE adapter {row['adapter']:.4f} | baseline {row['baseline']:.4f}")
 

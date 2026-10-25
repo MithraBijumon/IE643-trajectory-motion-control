@@ -10,3 +10,5 @@ sentencepiece
 protobuf
 gradio
 lpips  # optional: LPIPS image-preservation metric
+
+pytest  # optional: python -m pytest tests
