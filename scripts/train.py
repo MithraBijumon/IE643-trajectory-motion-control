@@ -10,6 +10,7 @@ Trains the trajectory condition encoder + motion adapter on top of a frozen LTX-
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
@@ -50,6 +51,15 @@ def make_loader(cfg, split, train):
 
 
 VAL_SIGMAS = (0.3, 0.6, 0.9)
+
+
+def lr_factor(step, total, warmup, floor=0.1):
+    """Linear warmup, then cosine decay to `floor` x the base lr. Short runs (a few hundred
+    updates) with zero-initialised projections are unstable without the warmup."""
+    if step < warmup:
+        return (step + 1) / warmup
+    progress = min((step - warmup) / max(total - warmup, 1), 1.0)
+    return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
 
 
 @torch.no_grad()
@@ -186,6 +196,13 @@ def main():
     accum = t["grad_accum"]
     motion.train()
 
+    updates_per_epoch = math.ceil(len(train_loader) / accum)
+    total_updates = updates_per_epoch * t["epochs"]
+    warmup = max(1, int(t.get("warmup_frac", 0.05) * total_updates))
+    base_lrs = [g["lr"] for g in optimizer.param_groups]
+    global_update = start_epoch * updates_per_epoch
+    print(f"{len(train_loader)} visits/epoch -> {updates_per_epoch} updates/epoch, {total_updates} in total (warmup {warmup})")
+
     for epoch in range(start_epoch, t["epochs"]):
         t0 = time.time()
         running, n = 0.0, 0
@@ -201,9 +218,13 @@ def main():
             n += 1
 
             if (step + 1) % accum == 0 or step + 1 == len(train_loader):
+                f = lr_factor(global_update, total_updates, warmup, t.get("lr_floor", 0.1))
+                for g, base in zip(optimizer.param_groups, base_lrs):
+                    g["lr"] = base * f
                 torch.nn.utils.clip_grad_norm_(motion.parameters(), t["grad_clip"])
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                global_update += 1
 
             if (step + 1) % t["log_every"] == 0:
                 print(
