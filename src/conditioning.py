@@ -88,6 +88,35 @@ def rasterize_trajectories(
         dim=2,
     )
 
+def entity_footprint(trajectory, visible, radius, grid_height, grid_width, min_sigma=0.75):
+    """
+    Gaussian footprint of the controlled object on the latent grid.
+
+    trajectory: (B, F, 2) normalized object centre per frame
+    visible:    (B, F)
+    radius:     (B,) object radius as a fraction of sqrt(H*W)
+
+    Returns (B, F, grid_height, grid_width), zero on frames where the object is hidden.
+    """
+    traj = trajectory.float()
+    vis = visible.bool()
+    device = traj.device
+    B = traj.shape[0]
+
+    cx = traj[..., 0] * grid_width  # in latent cells (square cells, so distances are isotropic)
+    cy = traj[..., 1] * grid_height
+
+    radius_cells = radius.float() * (grid_height * grid_width) ** 0.5
+    sigma = (0.5 * radius_cells).clamp(min=min_sigma).view(B, 1, 1, 1)
+
+    xs = torch.arange(grid_width, device=device).float() + 0.5
+    ys = torch.arange(grid_height, device=device).float() + 0.5
+    d2 = (xs.view(1, 1, 1, -1) - cx[..., None, None]) ** 2 + (
+        ys.view(1, 1, -1, 1) - cy[..., None, None]
+    ) ** 2
+    return torch.exp(-d2 / (2 * sigma**2)) * vis[..., None, None]
+
+
 def render_entity_condition(
     trajectory,
     visible,
@@ -115,21 +144,9 @@ def render_entity_condition(
     """
     traj = trajectory.float()
     vis = visible.bool()
-    device = traj.device
-    B, Fn, _ = traj.shape
+    B = traj.shape[0]
 
-    cx = traj[..., 0] * grid_width  # in latent cells (square cells, so distances are isotropic)
-    cy = traj[..., 1] * grid_height
-
-    radius_cells = radius.float() * (grid_height * grid_width) ** 0.5
-    sigma = (0.5 * radius_cells).clamp(min=min_sigma).view(B, 1, 1, 1)
-
-    xs = torch.arange(grid_width, device=device).float() + 0.5
-    ys = torch.arange(grid_height, device=device).float() + 0.5
-    d2 = (xs.view(1, 1, 1, -1) - cx[..., None, None]) ** 2 + (
-        ys.view(1, 1, -1, 1) - cy[..., None, None]
-    ) ** 2
-    footprint = torch.exp(-d2 / (2 * sigma**2)) * vis[..., None, None]  # (B, F, H, W)
+    footprint = entity_footprint(traj, vis, radius, grid_height, grid_width, min_sigma)  # (B, F, H, W)
 
     disp = torch.zeros_like(traj)
     disp[:, :-1] = traj[:, 1:] - traj[:, :-1]

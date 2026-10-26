@@ -39,7 +39,8 @@ train:
   log_every: 16                  # steps (visits) between printed loss lines
   save_every: 1                  # epochs
   seed: 0
-  cond_dropout: 0.1              # fraction of samples trained without the trajectory (enables motion_guidance)
+  focus_loss: 0.0                # >0: weight tokens around the controlled object by 1 + focus * footprint in the training loss (validation stays unweighted)
+  cond_dropout: 0.1             # fraction of samples trained without the trajectory (enables motion_guidance)
   max_val_samples: 16            # val clips used for the per-epoch val loss
 
 inference:

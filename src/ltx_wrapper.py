@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
+from src.conditioning import entity_footprint
 from src.motion_control import MotionControl, pack_latents, unpack_latents
 from src.segmentation import disk_mask
 from src.utils import torch_dtype, video_tensor_to_uint8
@@ -221,9 +222,12 @@ class LTXBackbone:
     # Training
     # ------------------------------------------------------------------
 
-    def training_loss(self, batch, generator=None, use_condition=None, sigma=None):
+    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None):
         """use_condition: None = normal (with condition dropout), True/False = force the
-        trajectory on/off for every sample (used to measure what the trajectory is worth)."""
+        trajectory on/off for every sample (used to measure what the trajectory is worth).
+        focus: extra loss weight on the tokens around the controlled object, w = 1 + focus * footprint
+        (None = train.focus_loss from the config, 0 = plain mean). Validation passes 0 so that
+        cond_gain stays comparable between runs."""
         video = batch["video"].permute(0, 2, 1, 3, 4)  # B,F,3,H,W -> B,3,F,H,W
         trajectory = batch["trajectory"].to(self.device)
         visible = batch["visible"].to(self.device)
@@ -275,6 +279,17 @@ class LTXBackbone:
         target = noise - x0_tokens
         err = ((pred - target) ** 2).mean(dim=-1)  # (B, S)
         w = (~keep).float()
+
+        focus = self.cfg["train"].get("focus_loss", 0.0) if focus is None else focus
+        if focus > 0:
+            # the trajectory only changes what happens around one object, a few percent of the
+            # tokens; weighting them up raises the share of the gradient that depends on it
+            radius = entity["radius"] if entity is not None else torch.full((B,), 0.06, device=self.device)
+            fp = entity_footprint(trajectory, visible, radius, Hl, Wl)  # (B, F, Hl, Wl)
+            # latent frame k shows video frame 8k (frame 0 is the clean image frame)
+            idx = [min(VAE_TEMPORAL * k, fp.shape[1] - 1) for k in range(Fl)]
+            w = w * (1 + focus * fp[:, idx].reshape(B, -1))
+
         return (err * w).sum() / w.sum()
 
     # ------------------------------------------------------------------

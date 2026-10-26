@@ -100,7 +100,7 @@ def validate(backbone, loader, device, seed=1234):
             name = batch["name"][0]
             for sg in VAL_SIGMAS:
                 losses[use][(name, sg)] = backbone.training_loss(
-                    batch, generator=gen, use_condition=use, sigma=sg
+                    batch, generator=gen, use_condition=use, sigma=sg, focus=0.0
                 ).item()
 
     backbone.motion.train()
@@ -133,6 +133,7 @@ def main():
     p.add_argument("--no_entity_embedding", action="store_true", help="entity condition without the per-object feature (footprint + flow only)")
     p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
     p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
+    p.add_argument("--focus_loss", type=float, default=None, help="extra training-loss weight around the controlled object: w = 1 + focus * footprint (0 = off)")
     p.add_argument("--eval_only", action="store_true", help="with --resume: print cond_gain on val clips and on train clips, then exit")
     p.add_argument("--overfit", type=int, default=0, metavar="K", help="sanity check: train and validate on the K most-moving clips only, fixed crop, no augmentation/dropout")
     args = p.parse_args()
@@ -158,6 +159,8 @@ def main():
         cfg["train"]["epochs"] = args.epochs
     if args.overfit:
         cfg["train"]["cond_dropout"] = 0.0
+    if args.focus_loss is not None:
+        cfg["train"]["focus_loss"] = args.focus_loss
 
     if args.variant:
         cfg["adapter"]["mode"] = args.variant

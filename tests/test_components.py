@@ -14,7 +14,7 @@ import torch
 
 from src.adapter import MotionAdapter
 from src.condition_encoder import ConditionEncoder, EntityConditionEncoder
-from src.conditioning import rasterize_trajectories, render_entity_condition
+from src.conditioning import entity_footprint, rasterize_trajectories, render_entity_condition
 from src.dataset import shift_mask
 from src.metrics import trajectory_metrics
 from src.motion_control import MotionControl, pack_latents, unpack_latents
@@ -65,6 +65,18 @@ def test_entity_condition_and_encoder_shapes():
     cond = render_entity_condition(traj, vis, emb, torch.tensor([0.1]), LATENT[1], LATENT[2])
     assert cond.shape == (1, 3 + 128, NF, LATENT[1], LATENT[2])
     assert EntityConditionEncoder()(cond).shape == (1, 128, *LATENT)
+
+
+def test_entity_footprint_peaks_at_the_object_and_vanishes_when_hidden():
+    traj, vis = trajectory(1)
+    vis[:, 5] = False
+    fp = entity_footprint(traj, vis, torch.tensor([0.1]), LATENT[1], LATENT[2])
+    assert fp.shape == (1, NF, LATENT[1], LATENT[2])
+    assert fp[0, 5].abs().max() == 0
+
+    y, x = np.unravel_index(int(fp[0, 0].argmax()), fp[0, 0].shape)
+    assert abs((x + 0.5) / LATENT[2] - float(traj[0, 0, 0])) < 1 / LATENT[2]
+    assert abs((y + 0.5) / LATENT[1] - float(traj[0, 0, 1])) < 1 / LATENT[1]
 
 
 def test_pack_unpack_roundtrip():
