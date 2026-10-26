@@ -234,6 +234,7 @@ def main():
     for epoch in range(start_epoch, t["epochs"]):
         t0 = time.time()
         running, n = 0.0, 0
+        norms, skipped = [], 0
         optimizer.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(train_loader):
@@ -249,8 +250,12 @@ def main():
                 f = lr_factor(global_update, total_updates, warmup, t.get("lr_floor", 0.1))
                 for g, base in zip(optimizer.param_groups, base_lrs):
                     g["lr"] = base * f
-                torch.nn.utils.clip_grad_norm_(motion.parameters(), t["grad_clip"])
-                optimizer.step()
+                gn = float(torch.nn.utils.clip_grad_norm_(motion.parameters(), t["grad_clip"]))
+                if math.isfinite(gn):
+                    norms.append(gn)
+                    optimizer.step()
+                else:
+                    skipped += 1  # a NaN/inf gradient would poison the weights for good
                 optimizer.zero_grad(set_to_none=True)
                 global_update += 1
 
@@ -277,6 +282,9 @@ def main():
             "gain_by_sigma": {str(k): round(x, 5) for k, x in v["gain_by_sigma"].items()},
             "gain_by_clip": {k: round(x, 5) for k, x in v["gain_by_clip"].items()},
             "adapter_scale": motion.gate_value(),
+            "grad_norm_mean": round(sum(norms) / max(len(norms), 1), 4),
+            "grad_norm_max": round(max(norms, default=0.0), 4),
+            "skipped_updates": skipped,
             "seconds": round(time.time() - t0, 1),
         }
         print(json.dumps(record))
