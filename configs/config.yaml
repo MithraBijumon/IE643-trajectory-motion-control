@@ -36,7 +36,7 @@ train:
   weight_decay: 0.0
   grad_clip: 1.0
   save_dir: checkpoints
-  log_every: 1
+  log_every: 16                  # steps (visits) between printed loss lines
   save_every: 1                  # epochs
   seed: 0
   cond_dropout: 0.1              # fraction of samples trained without the trajectory (enables motion_guidance)

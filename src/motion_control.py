@@ -169,7 +169,7 @@ class MotionControl(nn.Module):
         """One number to watch in the training log."""
         if self.mode == "input":
             return self.adapter.scale.item()
-        return float(torch.stack([p.weight.abs().mean() for p in self.projs]).mean())
+        return float(torch.stack([p.weight.detach().abs().mean() for p in self.projs]).mean())
 
     def trainable_state(self):
         state = {"condition_encoder": self.condition_encoder.state_dict()}

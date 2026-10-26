@@ -17,6 +17,7 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
@@ -25,19 +26,33 @@ from src.ltx_wrapper import LTXBackbone
 from src.utils import apply_checkpoint_cfg, get_device, load_config, seed_everything
 
 
-def make_loader(cfg, split, train):
+def most_moving(dataset, k):
+    """The k clips whose first num_frames of trajectory travel the furthest."""
+    def travel(sample):
+        t = np.load(os.path.join(sample[1], "trajectory.npy"))[: dataset.num_frames]
+        return np.linalg.norm(np.diff(t, axis=0), axis=1).sum()
+
+    return sorted(dataset.samples, key=travel, reverse=True)[:k]
+
+
+def make_loader(cfg, split, train, overfit=0):
+    """overfit=k: use only the k most-moving train clips, always the same crop, no augmentation, and
+    validate on those same clips. A sanity check: if the adapter cannot use the trajectory even here,
+    the setup is wrong, not the amount of data."""
     d = cfg["data"]
     dataset = TrajectoryDataset(
         root=d["root"],
-        split=split,
+        split="train" if overfit else split,
         num_frames=d["num_frames"],
-        random_crop=train,
+        random_crop=train and not overfit,
         load_video=True,
         height=d["height"],
         width=d["width"],
         repeat=d.get("repeat", 1) if train else 1,
-        augment=bool(d.get("augment", False)) and train,
+        augment=bool(d.get("augment", False)) and train and not overfit,
     )
+    if overfit:
+        dataset.samples = most_moving(dataset, overfit)
     if not train and len(dataset) > cfg["train"]["max_val_samples"]:
         dataset = Subset(dataset, range(cfg["train"]["max_val_samples"]))
 
@@ -117,6 +132,7 @@ def main():
     p.add_argument("--no_entity_embedding", action="store_true", help="entity condition without the per-object feature (footprint + flow only)")
     p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
     p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
+    p.add_argument("--overfit", type=int, default=0, metavar="K", help="sanity check: train and validate on the K most-moving clips only, fixed crop, no augmentation/dropout")
     args = p.parse_args()
 
     cfg = load_config(args.config, tiny=args.tiny)
@@ -138,13 +154,23 @@ def main():
         cfg["adapter"]["relative"] = True
     if args.epochs:
         cfg["train"]["epochs"] = args.epochs
+    if args.overfit:
+        cfg["train"]["cond_dropout"] = 0.0
 
     if args.variant:
         cfg["adapter"]["mode"] = args.variant
     if args.condition:
         cfg["adapter"]["condition"] = args.condition
     if args.resume:
+        before = dict(cfg["adapter"])
         apply_checkpoint_cfg(cfg, args.resume)
+        changed = {
+            k: (before.get(k), cfg["adapter"].get(k))
+            for k in set(before) | set(cfg["adapter"])
+            if before.get(k) != cfg["adapter"].get(k)
+        }
+        if changed:
+            print(f"NOTE: --resume replaces the adapter settings with the checkpoint's (config, checkpoint): {changed}")
 
     t = cfg["train"]
     device = get_device()
@@ -156,8 +182,10 @@ def main():
     print("Loading LTX...")
     backbone = LTXBackbone(cfg, device)
 
-    train_set, train_loader = make_loader(cfg, "train", train=True)
-    val_set, val_loader = make_loader(cfg, "val", train=False)
+    train_set, train_loader = make_loader(cfg, "train", train=True, overfit=args.overfit)
+    val_set, val_loader = make_loader(cfg, "val", train=False, overfit=args.overfit)
+    if args.overfit:
+        print(f"OVERFIT TEST on {[s[0] for s in train_set.samples]} (train and val are the same clips)")
     print(f"Train samples: {len(train_set)} | val samples: {len(val_set)}")
     if len(train_set) == 0:
         raise SystemExit(
