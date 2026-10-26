@@ -35,7 +35,7 @@ def most_moving(dataset, k):
     return sorted(dataset.samples, key=travel, reverse=True)[:k]
 
 
-def make_loader(cfg, split, train, overfit=0):
+def make_loader(cfg, split, train, overfit=0, limit=None):
     """overfit=k: use only the k most-moving train clips, always the same crop, no augmentation, and
     validate on those same clips. A sanity check: if the adapter cannot use the trajectory even here,
     the setup is wrong, not the amount of data."""
@@ -53,8 +53,9 @@ def make_loader(cfg, split, train, overfit=0):
     )
     if overfit:
         dataset.samples = most_moving(dataset, overfit)
-    if not train and len(dataset) > cfg["train"]["max_val_samples"]:
-        dataset = Subset(dataset, range(cfg["train"]["max_val_samples"]))
+    cap = limit or cfg["train"]["max_val_samples"]
+    if not train and len(dataset) > cap:
+        dataset = Subset(dataset, range(cap))
 
     loader = DataLoader(
         dataset,
@@ -132,6 +133,7 @@ def main():
     p.add_argument("--no_entity_embedding", action="store_true", help="entity condition without the per-object feature (footprint + flow only)")
     p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
     p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
+    p.add_argument("--eval_only", action="store_true", help="with --resume: print cond_gain on val clips and on train clips, then exit")
     p.add_argument("--overfit", type=int, default=0, metavar="K", help="sanity check: train and validate on the K most-moving clips only, fixed crop, no augmentation/dropout")
     args = p.parse_args()
 
@@ -184,6 +186,13 @@ def main():
 
     train_set, train_loader = make_loader(cfg, "train", train=True, overfit=args.overfit)
     val_set, val_loader = make_loader(cfg, "val", train=False, overfit=args.overfit)
+    # the same cond_gain measurement on training clips (fixed crop): train gain >> val gain = memorising,
+    # both ~0 = the adapter has simply not learned yet
+    train_eval = None
+    if not args.overfit:
+        _, train_eval = make_loader(cfg, "train", train=False, limit=6)
+    if args.eval_only and not args.resume:
+        raise SystemExit("--eval_only needs --resume <checkpoint>")
     if args.overfit:
         print(f"OVERFIT TEST on {[s[0] for s in train_set.samples]} (train and val are the same clips)")
     print(f"Train samples: {len(train_set)} | val samples: {len(val_set)}")
@@ -219,6 +228,21 @@ def main():
         start_epoch = ckpt["epoch"]
         best_val = ckpt.get("best_val", best_val)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
+
+    if args.eval_only:
+        for label, loader in (("val", val_loader), ("train", train_eval)):
+            if loader is None:
+                continue
+            v = validate(backbone, loader, device)
+            print(json.dumps({
+                "split": label,
+                "loss_with": v["with"],
+                "loss_without": v["without"],
+                "cond_gain": v["without"] - v["with"],
+                "gain_by_sigma": {str(k): round(x, 5) for k, x in v["gain_by_sigma"].items()},
+                "gain_by_clip": {k: round(x, 5) for k, x in v["gain_by_clip"].items()},
+            }))
+        return
 
     log_path = os.path.join(t["save_dir"], "log.jsonl")
     accum = t["grad_accum"]
@@ -273,12 +297,18 @@ def main():
             v = {"gain_by_sigma": {}, "gain_by_clip": {}}
             val_loss = val_loss_nocond = float("nan")
 
+        train_gain = None
+        if train_eval is not None:
+            tv = validate(backbone, train_eval, device)
+            train_gain = tv["without"] - tv["with"]
+
         record = {
             "epoch": epoch + 1,
             "train_loss": train_loss,
             "val_loss": val_loss,
             "val_loss_nocond": val_loss_nocond,
             "cond_gain": val_loss_nocond - val_loss,
+            "train_cond_gain": train_gain,
             "gain_by_sigma": {str(k): round(x, 5) for k, x in v["gain_by_sigma"].items()},
             "gain_by_clip": {k: round(x, 5) for k, x in v["gain_by_clip"].items()},
             "adapter_scale": motion.gate_value(),
