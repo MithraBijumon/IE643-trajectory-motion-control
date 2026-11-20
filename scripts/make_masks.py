@@ -41,6 +41,9 @@ def main():
     p.add_argument("--limit", type=int, default=None, help="only the first N samples per split")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--pick", choices=["largest", "best"], default="largest")
+    p.add_argument("--use_box", action="store_true",
+                   help="prompt SAM with the first-frame box (GOT-10k): taken from box.npy, or from the bounding box "
+                        "of the existing mask.png the first time (saved to box.npy so reruns do not lose it)")
     p.add_argument("--preview", default=None, help="contact sheet path (default: <data_root>/masks_preview.jpg)")
     args = p.parse_args()
 
@@ -59,11 +62,25 @@ def main():
             W, H = image.size
             point = np.load(os.path.join(folder, "trajectory.npy"))[0] * [W, H]
 
+            box = None
+            if args.use_box:
+                box_path = os.path.join(folder, "box.npy")
+                if os.path.exists(box_path):
+                    box = np.load(box_path)
+                elif os.path.exists(out_path):
+                    ys, xs = np.nonzero(np.array(Image.open(out_path).convert("L")) > 127)
+                    if len(xs):
+                        box = np.array([xs.min(), ys.min(), xs.max() + 1, ys.max() + 1], dtype=np.float32)
+                        np.save(box_path, box)
+
             if os.path.exists(out_path) and not args.overwrite:
                 mask = np.array(Image.open(out_path)) > 127
                 score = float("nan")
             else:
-                mask, score = segmenter.segment(image, point, args.pick)
+                if box is not None:
+                    mask, score = segmenter.segment_box(image, box)
+                else:
+                    mask, score = segmenter.segment(image, point, args.pick)
                 Image.fromarray((mask * 255).astype(np.uint8)).save(out_path)
 
             area = mask.mean()

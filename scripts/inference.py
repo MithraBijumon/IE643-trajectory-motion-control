@@ -94,12 +94,13 @@ def main():
     p.add_argument("--sample_dir", default=None)
     p.add_argument("--image", default=None)
     p.add_argument("--trajectory", default=None)
-    p.add_argument("--mask", default=None, help="object mask png for --image (condition=entity); optional")
+    p.add_argument("--mask", default=None, help="object mask png for --image ; optional")
     p.add_argument("--out", default="results/adapter/generated.mp4")
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--guidance", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--motion_guidance", type=float, default=None, help=">1 amplifies the trajectory")
+    p.add_argument("--ref_init", type=float, default=None, help="start from the drag video noised to this sigma (e.g. 0.8)")
     p.add_argument("--no_motion", action="store_true", help="run plain LTX image-to-video (baseline)")
     args = p.parse_args()
 
@@ -107,6 +108,8 @@ def main():
         p.error("give --sample_dir, or both --image and --trajectory")
 
     cfg = apply_checkpoint_cfg(load_config(args.config, tiny=args.tiny), args.checkpoint)
+    if args.ref_init is not None:
+        cfg["inference"]["ref_init"] = args.ref_init
     backbone = LTXBackbone(cfg, get_device())
 
     if args.checkpoint:

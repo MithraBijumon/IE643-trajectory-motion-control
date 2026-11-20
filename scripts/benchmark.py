@@ -7,8 +7,12 @@ point, one video is generated per path with the adapter, and one plain-LTX basel
 per image. Every video is tracked with CoTracker3 and scored for
 
     trajectory adherence : ATE, final-point error, direction cosine, progress
-    image preservation   : CLIP similarity to the input image (+ LPIPS if installed)
-    temporal consistency : CLIP similarity between neighbouring frames
+    image preservation   : CLIP similarity, first-frame PSNR/SSIM, colour drift (+ LPIPS if installed)
+    temporal consistency : CLIP neighbour similarity, optical-flow warping error (+ temporal LPIPS)
+    object level (SAM 2) : obj_* = tracked object-mask centroid path vs. the target, CLIP similarity of the
+                           object crop to the input object, size drift
+    video quality        : sharpness ratio, LAION aesthetic score, FVD-style distance (VideoMAE features) to real clips
+    PCK@5% / @10%        : fraction of frames where the tracked point is near the target
 
     python scripts/benchmark.py --checkpoint checkpoints/best.pt --num_images 8
     python scripts/benchmark.py --tiny --checkpoint <tiny ckpt> --num_images 1 --motions left,up
@@ -27,7 +31,9 @@ import numpy as np
 from PIL import Image, ImageDraw
 
 from src.ltx_wrapper import LTXBackbone
-from src.metrics import VideoQuality, trajectory_metrics
+from src.metrics import (AestheticScorer, VideoFeatures, VideoQuality, frechet_distance, object_appearance,
+                         object_trajectory_metrics, trajectory_metrics)
+from src.segmentation import Sam2Tracker
 from src.utils import (
     DIRECTIONS,
     apply_checkpoint_cfg,
@@ -57,6 +63,7 @@ def val_items(data_root, num_images, cfg):
             {
                 "mask": mask,
                 "name": name,
+                "video": os.path.join(folder, "video.mp4"),
                 "image": load_image(os.path.join(folder, "image.png"), d["height"], d["width"]),
                 "start": np.load(os.path.join(folder, "trajectory.npy"))[0],
             }
@@ -109,6 +116,7 @@ def main():
     p.add_argument("--length", type=float, default=0.3, help="path length as a fraction of the frame")
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--motion_guidance", type=float, default=None)
+    p.add_argument("--ref_init", type=float, default=None, help="start the adapter runs from the drag video noised to this sigma (e.g. 0.8)")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
 
@@ -119,6 +127,8 @@ def main():
 
     cfg = apply_checkpoint_cfg(load_config(args.config, tiny=args.tiny), args.checkpoint)
     data_root = args.data_root or cfg["data"]["root"]
+    if args.ref_init is not None:
+        cfg["inference"]["ref_init"] = args.ref_init
     inf = cfg["inference"]
     nF = cfg["data"]["num_frames"]
     steps = args.steps or inf["steps"]
@@ -132,9 +142,28 @@ def main():
         backbone.load_checkpoint(args.checkpoint)
     cotracker = load_cotracker(device)
     quality = VideoQuality(device)
+    aesthetic = AestheticScorer(device)
+    vfeat = VideoFeatures(device)
+    feats = {"adapter": [], "baseline": [], "real": []}
+
+    tracker = Sam2Tracker(device)   # object-level metrics: SAM 2 follows the frame-0 mask through each generated video
+
+    def extra(frames, label, target=None, mask=None, img_np=None):
+        out = {}
+        if tracker.ok and mask is not None:
+            masks = tracker.track(frames, mask)
+            out.update(object_appearance(quality, img_np, mask, frames, masks))
+            if target is not None:
+                out.update(object_trajectory_metrics(target, masks))
+        if aesthetic.ok:
+            out["aesthetic"] = aesthetic.score(frames)
+        if vfeat.ok:
+            if label in feats:   # the baseline video is scored once per image ("_dup" repeats it for other targets)
+                feats[label].append(vfeat(frames))
+        return out
 
     items = val_items(data_root, args.num_images, cfg)
-    print(f"{len(items)} images x {len(motions)} motions | adapter: {cfg['adapter']['mode']}/{cfg['adapter'].get('condition', 'points')} | motion_guidance {mg}")
+    print(f"{len(items)} images x {len(motions)} motions | motion_guidance {mg}")
 
     H, W = cfg["data"]["height"], cfg["data"]["width"]
     scale = np.array([W, H], dtype=np.float32)
@@ -164,7 +193,11 @@ def main():
         base_frames = generate(image, first_target, use_motion=False, mask=item["mask"])
         save_video(base_frames, os.path.join(args.out, "baseline", f"{name}.mp4"), fps=inf["fps"])
         base_track = track_point(cotracker, base_frames, first_target[0] * scale, device)
-        base_q = quality.score(img_np, base_frames)
+        base_q = {**quality.score(img_np, base_frames)}
+        if vfeat.ok:  # the real clip of this val sample = the reference distribution for FVD
+            import imageio.v2 as imageio
+            real = np.stack([np.asarray(f) for f in imageio.mimread(item["video"], memtest=False)][:nF])
+            feats["real"].append(vfeat(real))
 
         for motion in motions:
             target = linear_path(item["start"], DIRECTIONS[motion], args.length, nF)
@@ -178,8 +211,10 @@ def main():
             )
 
             track = track_point(cotracker, frames, target[0] * scale, device)
-            row = {"image": name, "motion": motion, **trajectory_metrics(target, track), **quality.score(img_np, frames)}
-            base_row = {"image": name, "motion": motion, **trajectory_metrics(target, base_track), **base_q}
+            row = {"image": name, "motion": motion, **trajectory_metrics(target, track), **quality.score(img_np, frames),
+                   **extra(frames, "adapter", target, item["mask"], img_np)}
+            base_row = {"image": name, "motion": motion, **trajectory_metrics(target, base_track), **base_q,
+                        **extra(base_frames, "baseline" if motion == motions[0] else "_dup", target, item["mask"], img_np)}
             records["adapter"].append(row)
             records["baseline"].append(base_row)
 
@@ -197,19 +232,32 @@ def main():
         summary["overall"][label] = aggregate(rows)
         summary["per_motion"][label] = {m: aggregate([r for r in rows if r["motion"] == m]) for m in motions}
 
+    # FVD-style distance (VideoMAE features) to the real val clips; only meaningful with enough videos
+    fvd = {}
+    if vfeat.ok and len(feats["real"]) >= 2:
+        for label in ("baseline", "adapter"):
+            if len(feats[label]) >= 2:
+                fvd[label] = frechet_distance(np.stack(feats[label]), np.stack(feats["real"]))
+        summary["fvd_videomae"] = fvd
+        summary["fvd_n"] = {k: len(v) for k, v in feats.items()}
+
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "results.json"), "w") as f:
         json.dump(
-            {"args": vars(args), "adapter_mode": cfg["adapter"]["mode"], "summary": summary, "records": records},
+            {"args": vars(args), "adapter_mode": "multilayer/entity", "summary": summary, "records": records},
             f,
             indent=2,
         )
     if montage_rows:
         montage(montage_rows, montage_labels, os.path.join(args.out, "montage.png"))
 
-    cols = ["ate", "epe_final", "direction_cos", "progress", "clip_image_sim", "clip_temporal"]
-    if "lpips_to_input" in summary["overall"]["adapter"]:
-        cols.append("lpips_to_input")
+    cols = ["ate", "epe_final", "pck_5", "pck_10", "direction_cos", "progress",
+            "clip_image_sim", "first_frame_psnr", "first_frame_ssim", "color_drift",
+            "clip_temporal", "warp_error", "sharpness_ratio", "aesthetic",
+            "obj_ate", "obj_direction_cos", "obj_progress", "obj_clip_sim", "obj_area_ratio"]
+    for extra in ("lpips_to_input", "lpips_temporal"):
+        if extra in summary["overall"]["adapter"]:
+            cols.append(extra)
 
     lines = ["| method | " + " | ".join(cols) + " |", "|---|" + "---|" * len(cols)]
     for label in ("baseline", "adapter"):

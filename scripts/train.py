@@ -50,6 +50,8 @@ def make_loader(cfg, split, train, overfit=0, limit=None):
         width=d["width"],
         repeat=d.get("repeat", 1) if train else 1,
         augment=bool(d.get("augment", False)) and train and not overfit,
+        mask_loss=bool(d.get("mask_loss", True)),
+        reference=bool(cfg["adapter"].get("reference", False)),
     )
     if overfit:
         dataset.samples = most_moving(dataset, overfit)
@@ -57,11 +59,15 @@ def make_loader(cfg, split, train, overfit=0, limit=None):
     if not train and len(dataset) > cap:
         dataset = Subset(dataset, range(cap))
 
+    workers = d["num_workers"]
     loader = DataLoader(
         dataset,
         batch_size=cfg["train"]["batch_size"] if train else 1,
         shuffle=train,
-        num_workers=d["num_workers"],
+        num_workers=workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=workers > 0,          # video decoding runs ahead of the GPU instead of stalling it
+        prefetch_factor=2 if workers > 0 else None,
     )
     return dataset, loader
 
@@ -93,15 +99,19 @@ def validate(backbone, loader, device, seed=1234):
 
     # losses[mode][(clip, sigma)] = loss
     losses = {True: {}, False: {}}
+    parts = {True: {"obj": {}, "bg": {}}, False: {"obj": {}, "bg": {}}}   # mean error inside / outside the object mask
     for use in (True, False):
         gen = torch.Generator(device=device).manual_seed(seed)
         for batch in loader:
             batch["video"] = batch["video"].to(device)
             name = batch["name"][0]
             for sg in VAL_SIGMAS:
-                losses[use][(name, sg)] = backbone.training_loss(
-                    batch, generator=gen, use_condition=use, sigma=sg, focus=0.0
-                ).item()
+                loss, pt = backbone.training_loss(
+                    batch, generator=gen, use_condition=use, sigma=sg, focus=0.0, return_parts=True
+                )
+                losses[use][(name, sg)] = loss.item()
+                for k in ("obj", "bg"):
+                    parts[use][k][(name, sg)] = pt[k]
 
     backbone.motion.train()
 
@@ -112,6 +122,9 @@ def validate(backbone, loader, device, seed=1234):
     return {
         "with": mean(losses[True], keys),
         "without": mean(losses[False], keys),
+        # the same comparison restricted to the object's tokens / the background tokens
+        "obj_with": mean(parts[True]["obj"], keys), "obj_without": mean(parts[False]["obj"], keys),
+        "bg_with": mean(parts[True]["bg"], keys), "bg_without": mean(parts[False]["bg"], keys),
         "gain_by_sigma": {sg: gain([k for k in keys if k[1] == sg]) for sg in VAL_SIGMAS},
         "gain_by_clip": {n: gain([k for k in keys if k[0] == n]) for n in dict.fromkeys(k[0] for k in keys)},
     }
@@ -125,15 +138,14 @@ def main():
     p.add_argument("--save_dir", default=None)
     p.add_argument("--epochs", type=int, default=None)
     p.add_argument("--resume", default=None)
-    p.add_argument("--variant", choices=["input", "multilayer"], default=None, help="adapter mode (overrides config)")
     p.add_argument("--lr", type=float, default=None)
     p.add_argument("--grad_accum", type=int, default=None)
     p.add_argument("--relative", action="store_true", help="multilayer: inject relative to the hidden-state RMS")
     p.add_argument("--no_augment", action="store_true", help="disable random-track + mirror augmentation")
     p.add_argument("--no_entity_embedding", action="store_true", help="entity condition without the per-object feature (footprint + flow only)")
     p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
-    p.add_argument("--condition", choices=["points", "entity"], default=None, help="condition type (overrides config)")
     p.add_argument("--focus_loss", type=float, default=None, help="extra training-loss weight around the controlled object: w = 1 + focus * footprint (0 = off)")
+    p.add_argument("--no_grad_ckpt", action="store_true", help="turn gradient checkpointing off: ~30%% faster, needs an 80 GB card")
     p.add_argument("--eval_only", action="store_true", help="with --resume: print cond_gain on val clips and on train clips, then exit")
     p.add_argument("--overfit", type=int, default=0, metavar="K", help="sanity check: train and validate on the K most-moving clips only, fixed crop, no augmentation/dropout")
     args = p.parse_args()
@@ -157,15 +169,13 @@ def main():
         cfg["adapter"]["relative"] = True
     if args.epochs:
         cfg["train"]["epochs"] = args.epochs
+    if args.no_grad_ckpt:
+        cfg["model"]["gradient_checkpointing"] = False
     if args.overfit:
         cfg["train"]["cond_dropout"] = 0.0
     if args.focus_loss is not None:
         cfg["train"]["focus_loss"] = args.focus_loss
 
-    if args.variant:
-        cfg["adapter"]["mode"] = args.variant
-    if args.condition:
-        cfg["adapter"]["condition"] = args.condition
     if args.resume:
         before = dict(cfg["adapter"])
         apply_checkpoint_cfg(cfg, args.resume)
@@ -180,9 +190,13 @@ def main():
     t = cfg["train"]
     device = get_device()
     seed_everything(t["seed"])
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = True   # the fp32 parts (condition encoder, losses) use tensor cores
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True          # the 3D convs of the condition encoder see fixed shapes
     os.makedirs(t["save_dir"], exist_ok=True)
 
-    print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: {cfg['adapter']['mode']} / {cfg['adapter'].get('condition', 'points')}"
+    print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: multilayer / entity"
           f" | relative: {cfg['adapter'].get('relative', False)} | augment: {cfg['data'].get('augment', False)} | embedding: {cfg['adapter'].get('entity_embedding', True)} | lr {cfg['train']['lr']} accum {cfg['train']['grad_accum']}")
     print("Loading LTX...")
     backbone = LTXBackbone(cfg, device)
@@ -206,14 +220,7 @@ def main():
         )
 
     motion = backbone.motion
-    scale_params = motion.gate_params()
-    scale_ids = {id(q) for q in scale_params}
-    other_params = [q for q in motion.parameters() if id(q) not in scale_ids]
-
-    groups = [{"params": other_params, "lr": t["lr"]}]
-    if scale_params:
-        groups.append({"params": scale_params, "lr": t["scale_lr"], "weight_decay": 0.0})
-    optimizer = torch.optim.AdamW(groups, weight_decay=t["weight_decay"])
+    optimizer = torch.optim.AdamW(motion.parameters(), lr=t["lr"], weight_decay=t["weight_decay"])
 
     print(
         "Trainable parameters:",
@@ -226,8 +233,6 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         # load_state_dict restores the old lrs; re-apply the ones from the config
         optimizer.param_groups[0]["lr"] = t["lr"]
-        if len(optimizer.param_groups) > 1:
-            optimizer.param_groups[1]["lr"] = t["scale_lr"]
         start_epoch = ckpt["epoch"]
         best_val = ckpt.get("best_val", best_val)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
@@ -251,29 +256,32 @@ def main():
     accum = t["grad_accum"]
     motion.train()
 
-    updates_per_epoch = math.ceil(len(train_loader) / accum)
+    # an epoch is a random subset of at most max_visits_per_epoch visits (the loader reshuffles every epoch),
+    # so validation / checkpoints / divergence checks come at a predictable interval
+    visits = min(len(train_loader), t.get("max_visits_per_epoch") or len(train_loader))
+    updates_per_epoch = math.ceil(visits / accum)
     total_updates = updates_per_epoch * t["epochs"]
     warmup = max(1, int(t.get("warmup_frac", 0.05) * total_updates))
     base_lrs = [g["lr"] for g in optimizer.param_groups]
     global_update = start_epoch * updates_per_epoch
-    print(f"{len(train_loader)} visits/epoch -> {updates_per_epoch} updates/epoch, {total_updates} in total (warmup {warmup})")
+    print(f"{visits} visits/epoch (of {len(train_loader)}) -> {updates_per_epoch} updates/epoch, {total_updates} in total (warmup {warmup})")
 
     for epoch in range(start_epoch, t["epochs"]):
         t0 = time.time()
-        running, n = 0.0, 0
+        running, n = torch.zeros((), device=device), 0
         norms, skipped = [], 0
         optimizer.zero_grad(set_to_none=True)
 
         for step, batch in enumerate(train_loader):
-            batch["video"] = batch["video"].to(device)
+            batch["video"] = batch["video"].to(device, non_blocking=True)
 
             loss = backbone.training_loss(batch)
             (loss / accum).backward()
 
-            running += loss.item()
+            running += loss.detach()   # a tensor: no GPU->CPU sync every step
             n += 1
 
-            if (step + 1) % accum == 0 or step + 1 == len(train_loader):
+            if (step + 1) % accum == 0 or step + 1 == visits:
                 f = lr_factor(global_update, total_updates, warmup, t.get("lr_floor", 0.1))
                 for g, base in zip(optimizer.param_groups, base_lrs):
                     g["lr"] = base * f
@@ -288,16 +296,21 @@ def main():
 
             if (step + 1) % t["log_every"] == 0:
                 print(
-                    f"Epoch {epoch + 1}/{t['epochs']} step {step + 1}/{len(train_loader)} "
-                    f"loss {loss.item():.5f} gate {motion.gate_value():.5f}"
+                    f"Epoch {epoch + 1}/{t['epochs']} step {step + 1}/{visits} "
+                    f"({(time.time() - t0) / (step + 1) * (visits - step - 1) / 60:.1f} min left) loss {loss.item():.5f} gate {motion.gate_value():.5f} inject {motion.injection_ratio():.4f}"
                 )
 
-        train_loss = running / max(n, 1)
+            if step + 1 >= visits:
+                break
+
+        train_loss = float(running) / max(n, 1)
+        inject_ratio = motion.injection_ratio()  # read now: validation below switches the trajectory off
         if len(val_set):
             v = validate(backbone, val_loader, device)
             val_loss, val_loss_nocond = v["with"], v["without"]
         else:
-            v = {"gain_by_sigma": {}, "gain_by_clip": {}}
+            v = {"gain_by_sigma": {}, "gain_by_clip": {}, "obj_with": float("nan"), "obj_without": float("nan"),
+                 "bg_with": float("nan"), "bg_without": float("nan")}
             val_loss = val_loss_nocond = float("nan")
 
         train_gain = None
@@ -312,9 +325,13 @@ def main():
             "val_loss_nocond": val_loss_nocond,
             "cond_gain": val_loss_nocond - val_loss,
             "train_cond_gain": train_gain,
+            "val_obj_gain": v["obj_without"] - v["obj_with"],   # cond_gain on the object's tokens only
+            "val_bg_gain": v["bg_without"] - v["bg_with"],      # ... and on the background (should stay ~0)
+            "val_obj_loss": v["obj_with"], "val_bg_loss": v["bg_with"],
             "gain_by_sigma": {str(k): round(x, 5) for k, x in v["gain_by_sigma"].items()},
             "gain_by_clip": {k: round(x, 5) for k, x in v["gain_by_clip"].items()},
             "adapter_scale": motion.gate_value(),
+            "inject_ratio": inject_ratio,
             "grad_norm_mean": round(sum(norms) / max(len(norms), 1), 4),
             "grad_norm_max": round(max(norms, default=0.0), 4),
             "skipped_updates": skipped,

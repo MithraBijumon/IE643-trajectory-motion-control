@@ -1,0 +1,75 @@
+# 2B LTX-Video 0.9.5 (bf16): a much cheaper model for quick experiments on an A100 or a 24 GB+ card. --config configs/ltx2b.yaml
+# Every script reads this file; CLI flags override individual values.
+
+model:
+  id: Lightricks/LTX-Video-0.9.5
+  dtype: bfloat16                # dtype of the frozen LTX weights
+  prompt: "A static camera shot of a single subject in a real, natural scene. The subject moves smoothly and steadily, keeping its exact shape, colors and texture, while the background stays still and sharp. Realistic lighting, high quality, detailed, stable footage, natural motion."
+  negative_prompt: "worst quality, blurry, jittery, distorted, deformed, morphing, melting, flickering, warping, low resolution, inconsistent motion, extra objects, text, watermark"
+  gradient_checkpointing: true   # needed to backprop through the 13B transformer
+  vae_tiling: false
+
+adapter:
+  inject_every: 2                # multilayer only: 48 blocks / 2 = 24 injection points (4 = 12 points)
+  cond_blocks: 2                 # small trainable transformer blocks (dim 128) on the condition tokens, before injection; 0 = off
+  cond_heads: 4
+  reference: true                # also feed the VAE latents of a rendered "drag video" (the object's cut-out moved along the path, src/reference.py): a pixel-aligned condition
+  local_inject: 2.0              # inject only near the object (footprint radius = 2 x the object's); the background gets no residual. 0 = inject everywhere (old behaviour)
+  relative: true                 # multilayer: inject relative to the hidden-state RMS (absolute injection is easily drowned out)
+  entity_embedding: true         # entity condition: also paint the object's own latent feature (set false if the model memorises scenes)
+  mask_shape: true               # entity condition: paint the object's real SAM silhouette (translated along the path) instead of a round blob
+  embedding_dropout: 0.3         # entity condition: hide the object feature in this fraction of training steps (fights memorising scenes)
+  max_inject: 0.05               # multilayer+relative: hard cap on |injection| / |hidden state| per block (safety brake; raise once training is stable)
+
+data:
+  root: data/dataset_got10k
+  num_frames: 33                 # must be 8k+1 and <= the shortest clip (GOT-10k clips here have 33-65 frames). 17 frames = only 3 latent frames, 1 of them the clean image: almost no motion to learn from
+  height: 480                    # must be a multiple of 32
+
+  width: 864                     # must be a multiple of 32
+  rope_fps: 24                   # frame rate for the rotary time coordinates. GOT-10k is ~10 fps: try 10 as an experiment (changes how fast LTX expects motion to be)
+  num_workers: 4                 # video decoding in background workers (set 0 if the machine has <4 CPU cores)
+  mask_loss: true                # SAM 2 per-frame masks weight the training loss on the object (focus_loss). false = Gaussian footprint along the path instead (ablation)
+  augment: true                  # train only: a random tracked point (tracks.npy) per visit + random mirror flip; fights overfitting on few scenes
+  repeat: 2                      # train only: visits per clip per epoch (each visit = new random crop/track/flip). Updates per epoch = clips * repeat / grad_accum
+
+train:
+  batch_size: 1
+  grad_accum: 1                  # 1 = 4x more weight updates per epoch than 4 (the adapter needs many updates); same GPU time
+  epochs: 20                     # with repeat 2: ~99 updates per epoch, so val / checkpoints / divergence show up every ~12 min instead of every ~47
+  max_visits_per_epoch: 256      # an epoch = at most this many visits (random subset, reshuffled each epoch): 64 updates, roughly 8-10 min on an A100 plus ~1.5 min validation
+  lr: 3.0e-5                     # condition encoder + adapter projections (peak). 5e-4 DIVERGED: an Adam step then moves the injection by ~6% of the hidden state; cond_gain went to -1.45
+  warmup_frac: 0.05              # fraction of all updates spent warming the lr up from 0
+  lr_floor: 0.1                  # cosine decay ends at this fraction of lr
+  weight_decay: 0.0
+  grad_clip: 1.0
+  save_dir: checkpoints
+  log_every: 16                  # steps (visits) between printed loss lines
+  save_every: 1                  # epochs
+  seed: 0
+  focus_loss: 5.0                # >0: weight tokens around the controlled object by 1 + focus * footprint in the training loss (validation stays unweighted)
+  split_loss: true               # with focus_loss: average the object tokens and the background tokens SEPARATELY, L = (focus*L_obj + L_bg)/(focus+1); false = one weighted mean
+  time_ramp: 1.0                 # object-token weight grows linearly over time, (1 + time_ramp) x in the last latent frame (0 = flat)
+  sigma_mean: 0.5                # >0 samples noisier timesteps more often (logit-normal mean); the motion is decided at high noise. 0 = LTX default
+  cond_dropout: 0.1             # fraction of samples trained without the trajectory (enables motion_guidance)
+  max_val_samples: 16            # val clips used for the per-epoch val loss
+
+inference:
+  steps: 40
+  ref_init: 0.0                  # >0 (e.g. 0.8): start denoising from the drag video noised to this sigma (training-free boost; benchmark/inference --ref_init)
+  guidance_scale: 3.0            # >1 enables classifier-free guidance on the text prompt
+  decode_timestep: 0.05
+  motion_guidance: 1.0           # >1 amplifies the trajectory (e.g. 2-4); costs a second forward pass per step
+  fps: 24
+  seed: 0
+
+# Applied by --tiny: a randomly initialised miniature LTX that runs on CPU in
+# seconds. Used to verify the whole pipeline without downloading 13B weights.
+tiny:
+  dtype: float32
+  num_frames: 17
+  height: 64
+  width: 96
+  epochs: 2
+  grad_accum: 1
+  steps: 4

@@ -32,17 +32,17 @@ def read(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def style(ax, ylabel, title):
+def style(ax, ylabel, title, fs=8):
     ax.set_facecolor(SURFACE)
     ax.grid(axis="y", color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
     for side in ("top", "right", "left"):
         ax.spines[side].set_visible(False)
     ax.spines["bottom"].set_color(AXIS)
-    ax.tick_params(colors=INK2, labelsize=8, length=0)
-    ax.set_xlabel("epoch", color=INK2, fontsize=8)
-    ax.set_ylabel(ylabel, color=INK2, fontsize=8)
-    ax.set_title(title, color=INK, fontsize=9, loc="left", fontweight="semibold")
+    ax.tick_params(colors=INK2, labelsize=fs, length=0)
+    ax.set_xlabel("epoch", color=INK2, fontsize=fs)
+    ax.set_ylabel(ylabel, color=INK2, fontsize=fs)
+    ax.set_title(title, color=INK, fontsize=fs + 1, loc="left", fontweight="semibold")
 
 
 def finish(fig, path):
@@ -97,6 +97,30 @@ def full_figure(rows, path):
     finish(fig, path)
 
 
+def slide_figure(overfit_rows, full_rows, path):
+    """Both stories in one tall, large-print figure for a presentation slide."""
+    fig, (a, b) = plt.subplots(2, 1, figsize=(4.6, 5.4))
+    fs = 11
+
+    ep = [r["epoch"] for r in overfit_rows]
+    a.plot(ep, [r["val_loss_nocond"] for r in overfit_rows], color=MUTED, linewidth=2.5, marker="o", markersize=5, label="without trajectory")
+    a.plot(ep, [r["val_loss"] for r in overfit_rows], color=BLUE, linewidth=2.5, marker="o", markersize=5, label="with trajectory")
+    style(a, "validation loss", "One clip: the trajectory is used", fs)
+    a.set_xticks(ep)
+    a.legend(frameon=False, fontsize=fs - 1, labelcolor=INK2, loc="center left", bbox_to_anchor=(0.0, 0.3))
+
+    ep = [r["epoch"] for r in full_rows]
+    gain = [r["cond_gain"] for r in full_rows]
+    b.axhspan(-NOISE_FLOOR, NOISE_FLOOR, color=GRID, zorder=0)
+    b.bar(ep, gain, color=BLUE, width=0.6, zorder=2)
+    b.axhline(0, color=AXIS, linewidth=1, zorder=3)
+    style(b, "gain (loss without - with)", "24 scenes, held-out: gain ~ 0", fs)
+    b.set_xticks(ep)
+    b.set_ylim(min(gain) - 0.0004, max(max(gain), NOISE_FLOOR) + 0.0004)
+    b.text(ep[-1] + 0.4, NOISE_FLOOR * 1.1, "noise floor", fontsize=fs - 3, color=MUTED, ha="right", va="bottom")
+    finish(fig, path)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--full", default="results/logs/full_run_log.jsonl")
@@ -106,6 +130,7 @@ def main():
 
     overfit_figure(read(args.overfit), os.path.join(args.out, "fig_overfit.png"))
     full_figure(read(args.full), os.path.join(args.out, "fig_fullrun.png"))
+    slide_figure(read(args.overfit), read(args.full), os.path.join(args.out, "slide_training.png"))
 
 
 if __name__ == "__main__":

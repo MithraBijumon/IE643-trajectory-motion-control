@@ -7,6 +7,7 @@ import torch.nn.functional as F_nn
 from PIL import Image
 from torch.utils.data import Dataset
 
+from src.reference import render_reference
 from src.segmentation import disk_mask
 
 
@@ -23,9 +24,13 @@ class TrajectoryDataset(Dataset):
         default_radius=0.06,
         repeat=1,
         augment=False,
+        mask_loss=True,
+        reference=False,
     ):
         # augment (train only): a random tracked point per visit (tracks.npy) and a random mirror flip
         self.augment = augment
+        self.reference = reference  # also return a rendered "drag video" (src/reference.py) as an extra condition
+        self.mask_loss = mask_loss  # False: SAM 2 masks only on the INPUT side (conditioning frame), never to weight the loss
         self.repeat = repeat  # visit every clip this many times per epoch (each visit = a new random crop)
         self.default_radius = default_radius
         self.height = height
@@ -56,30 +61,29 @@ class TrajectoryDataset(Dataset):
         name, folder, length = self.samples[idx % len(self.samples)]
         F = self.num_frames
 
-        start = (
-            np.random.randint(0, length - F + 1)
-            if self.random_crop
-            else 0
-        )
+        # augment: sometimes take every 2nd frame (2x faster motion) when the clip is long enough
+        stride = 2 if self.augment and self.random_crop and length > 2 * (F - 1) and np.random.rand() < 0.5 else 1
+        start = np.random.randint(0, length - (F - 1) * stride) if self.random_crop else 0
+        ids = start + stride * np.arange(F)
 
         full_trajectory = np.load(os.path.join(folder, "trajectory.npy"))
-        trajectory = full_trajectory[start:start + F]
+        trajectory = full_trajectory[ids]
 
         visibility_path = os.path.join(folder, "visibility.npy")
         if os.path.exists(visibility_path):
             full_visible = np.load(visibility_path)
-            visible = full_visible[start:start + F]
+            visible = full_visible[ids]
         else:
             full_visible = np.ones(len(full_trajectory), dtype=bool)
             visible = np.ones(F, dtype=bool)
 
         swapped = False
         if self.augment:
-            pick = self.pick_track(folder, start, F)
+            pick = self.pick_track(folder, ids)
             if pick is not None:
                 full_trajectory, full_visible = pick
-                trajectory = full_trajectory[start:start + F]
-                visible = full_visible[start:start + F]
+                trajectory = full_trajectory[ids]
+                visible = full_visible[ids]
                 swapped = True
 
         flip = self.augment and np.random.rand() < 0.5
@@ -88,6 +92,8 @@ class TrajectoryDataset(Dataset):
             trajectory[:, 0] = 1.0 - trajectory[:, 0]
             full_trajectory = full_trajectory.copy()
             full_trajectory[:, 0] = 1.0 - full_trajectory[:, 0]
+
+        lowres = None if swapped else self.load_lowres_masks(folder, ids, flip)
 
         item = {
             "name": name,
@@ -99,8 +105,7 @@ class TrajectoryDataset(Dataset):
         if self.load_video:
             video = read_video(
                 os.path.join(folder, "video.mp4"),
-                start,
-                F,
+                ids,
             )
 
             video = (
@@ -124,9 +129,16 @@ class TrajectoryDataset(Dataset):
             item["video"] = video
             item["image"] = video[0]
 
-            mask, area = self.load_mask(
-                folder, full_trajectory, start, *video.shape[-2:], use_file=not swapped, flipped=flip
-            )
+            mask, area = (None, 0.0)
+            if lowres is not None:
+                # SAM 2 mask OF the conditioning frame itself: no shifting, correct size and shape
+                mask, area = mask_from_lowres(lowres[0], *video.shape[-2:])
+                if self.mask_loss:
+                    item["loss_masks"] = torch.from_numpy(lowres).float() / 255.0  # (F, h, w) true object per frame
+            if mask is None:
+                mask, area = self.load_mask(
+                    folder, full_trajectory, start, *video.shape[-2:], use_file=not swapped, flipped=flip
+                )
 
             if flip:
                 video = video.flip(-1)
@@ -136,10 +148,26 @@ class TrajectoryDataset(Dataset):
             item["mask"] = torch.from_numpy(mask).float().unsqueeze(0)  # (1, H, W)
             item["mask_area"] = torch.tensor(area, dtype=torch.float32)
 
+            if self.reference:
+                image_np = ((video[0].permute(1, 2, 0) + 1) * 127.5).round().clamp(0, 255).byte().numpy()
+                ref = render_reference(image_np, mask, trajectory, visible)  # all of these are already mirrored
+                item["reference"] = torch.from_numpy(ref).permute(0, 3, 1, 2).contiguous()  # (F, 3, H, W) uint8
+
         return item
 
 
-    def pick_track(self, folder, start, F, min_visible=0.8):
+    def load_lowres_masks(self, folder, ids, flipped):
+        """Per-frame SAM 2 masks (scripts/make_video_masks.py) for the crop, (F, h, w) uint8, or None."""
+        path = os.path.join(folder, "masks_lowres.npy")
+        if not os.path.exists(path):
+            return None
+        arr = np.load(path, mmap_mode="r")
+        if len(arr) <= ids[-1]:
+            return None
+        crop = np.array(arr[ids])
+        return np.ascontiguousarray(crop[:, :, ::-1]) if flipped else crop
+
+    def pick_track(self, folder, ids, min_visible=0.8):
         """A random tracked point of this clip for the crop [start, start+F), favouring moving ones.
 
         Returns (trajectory, visibility) over the whole clip, or None when the clip has no
@@ -151,7 +179,7 @@ class TrajectoryDataset(Dataset):
             return None
 
         tracks, vis = np.load(tp), np.load(vp)  # (N, T, 2), (N, T)
-        window = slice(start, start + F)
+        window, start = ids, ids[0]
         # visible in most of the crop AND in its first frame (the conditioning image shows the object)
         ok = np.where((vis[:, window].mean(1) >= min_visible) & vis[:, start])[0]
         if len(ok) == 0:
@@ -193,6 +221,15 @@ class TrajectoryDataset(Dataset):
         return mask, area
 
 
+def mask_from_lowres(lowres, H, W):
+    """(h, w) uint8 coverage -> ((H, W) bool mask, area fraction); (None, 0) when the object is gone."""
+    m = torch.from_numpy(np.ascontiguousarray(lowres)).float()[None, None] / 255.0
+    m = F_nn.interpolate(m, size=(H, W), mode="bilinear", align_corners=False)[0, 0].numpy() > 0.5
+    if not m.any():
+        return None, 0.0
+    return m, float(m.mean())
+
+
 def shift_mask(mask, dx, dy):
     """Translate a boolean mask by (dx, dy) pixels, filling with False."""
     H, W = mask.shape
@@ -205,15 +242,15 @@ def shift_mask(mask, dx, dy):
     return out
 
 
-def read_video(path, start, num_frames):
+def read_video(path, ids):
     reader = imageio.get_reader(path)
-    frames = []
+    frames, want = [], set(int(i) for i in ids)
 
     try:
         for i, frame in enumerate(reader):
-            if i >= start + num_frames:
+            if i > max(want):
                 break
-            if i >= start:
+            if i in want:
                 frames.append(frame)
     finally:
         reader.close()

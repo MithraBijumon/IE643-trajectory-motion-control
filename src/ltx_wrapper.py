@@ -5,8 +5,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from src.conditioning import entity_footprint
+from src.conditioning import SHAPE_FACTOR, entity_footprint
 from src.motion_control import MotionControl, pack_latents, unpack_latents
+from src.reference import render_reference
 from src.segmentation import disk_mask
 from src.utils import torch_dtype, video_tensor_to_uint8
 
@@ -56,12 +57,15 @@ class LTXBackbone:
         tc = self.transformer.config
         self.motion = MotionControl(
             dim=tc.in_channels,
-            mode=a.get("mode", "input"),
             num_blocks=len(self.transformer.transformer_blocks),
             hidden_dim=tc.num_attention_heads * tc.attention_head_dim,
             inject_every=a.get("inject_every", 4),
-            condition=a.get("condition", "points"),
             relative=a.get("relative", False),
+            max_inject=a.get("max_inject", 0.0),
+            cond_blocks=a.get("cond_blocks", 0),
+            cond_heads=a.get("cond_heads", 4),
+            local_inject=a.get("local_inject", 0.0),
+            reference=a.get("reference", False),
         ).to(self.device)
         self.motion.attach(self.transformer)
 
@@ -158,7 +162,7 @@ class LTXBackbone:
         video = self.vae.decode(z, timestep, return_dict=False)[0]
         return video_tensor_to_uint8(video)
 
-    def entity_features(self, first_latent, mask, area):
+    def entity_features(self, first_latent, mask, area, training=False):
         """The controlled object as the network sees it.
 
         first_latent: (B, 128, H', W') normalized latent of the conditioning frame
@@ -170,13 +174,28 @@ class LTXBackbone:
         """
         w = F.adaptive_avg_pool2d(mask.float(), first_latent.shape[-2:])
         embedding = (w * first_latent).sum((2, 3)) / w.sum((2, 3)).clamp(min=1e-6)
-        if not self.cfg.get("adapter", {}).get("entity_embedding", True):
+        a = self.cfg.get("adapter", {})
+        if not a.get("entity_embedding", True):
             embedding = torch.zeros_like(embedding)
+        elif training and a.get("embedding_dropout", 0.0) > 0:
+            # an appearance vector lets the adapter recognise (memorise) scenes; hiding it for some
+            # samples forces it to also work from the footprint and the motion alone
+            keep = (torch.rand(embedding.shape[0], 1, device=embedding.device) >= a["embedding_dropout"]).float()
+            embedding = embedding * keep
 
-        return {"embedding": embedding, "radius": (area.float() / math.pi).sqrt()}
+        out = {"embedding": embedding, "radius": (area.float() / math.pi).sqrt()}
+        if a.get("mask_shape", True):
+            Hl, Wl = first_latent.shape[-2:]
+            out["shape"] = F.adaptive_avg_pool2d(mask.float(), (SHAPE_FACTOR * Hl, SHAPE_FACTOR * Wl))
+        return out
 
-    def video_coords(self, batch, latent_shape, frame_rate=24):
+    def rope_fps(self):
+        """Frame rate used for the rotary time coordinates (the data's real fps if you set data.rope_fps)."""
+        return self.cfg["data"].get("rope_fps", 24)
+
+    def video_coords(self, batch, latent_shape, frame_rate=None):
         """Rotary position coordinates, same construction as LTXConditionPipeline."""
+        frame_rate = frame_rate or self.rope_fps()
         Fl, Hl, Wl = latent_shape
         coords = torch.meshgrid(
             torch.arange(Fl), torch.arange(Hl), torch.arange(Wl), indexing="ij"
@@ -222,12 +241,13 @@ class LTXBackbone:
     # Training
     # ------------------------------------------------------------------
 
-    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None):
+    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None, return_parts=False):
         """use_condition: None = normal (with condition dropout), True/False = force the
         trajectory on/off for every sample (used to measure what the trajectory is worth).
         focus: extra loss weight on the tokens around the controlled object, w = 1 + focus * footprint
         (None = train.focus_loss from the config, 0 = plain mean). Validation passes 0 so that
-        cond_gain stays comparable between runs."""
+        cond_gain stays comparable between runs.
+        return_parts: also return {"obj": ..., "bg": ...}, the plain mean error inside / outside the object mask."""
         video = batch["video"].permute(0, 2, 1, 3, 4)  # B,F,3,H,W -> B,3,F,H,W
         trajectory = batch["trajectory"].to(self.device)
         visible = batch["visible"].to(self.device)
@@ -240,7 +260,9 @@ class LTXBackbone:
         noise = torch.randn(x0_tokens.shape, generator=generator, device=self.device)
 
         # logit-normal sigma sampling, as in LTX / SD3 flow-matching training
-        drawn = torch.sigmoid(torch.randn(B, 1, generator=generator, device=self.device))
+        # train.sigma_mean > 0 shifts it towards noisier steps, where the motion is decided
+        mean = self.cfg["train"].get("sigma_mean", 0.0)
+        drawn = torch.sigmoid(torch.randn(B, 1, generator=generator, device=self.device) + mean)
         # `sigma` (a float in (0, 1)) pins the noise level, e.g. for a validation grid
         sigma = drawn if sigma is None else torch.full_like(drawn, float(sigma))
         keep = self.first_frame_mask(B, latent_shape, self.device)
@@ -255,22 +277,23 @@ class LTXBackbone:
         if use_condition is not None:
             cond_mask = torch.full((B,), float(use_condition), device=self.device)
 
-        entity = None
-        if self.motion.condition == "entity":
-            entity = self.entity_features(
-                x0[:, :, 0], batch["mask"].to(self.device), batch["mask_area"].to(self.device)
-            )
+        entity = self.entity_features(
+            x0[:, :, 0], batch["mask"].to(self.device), batch["mask_area"].to(self.device),
+            training=use_condition is None,  # embedding dropout only in real training steps, not in validation
+        )
+
+        if self.motion.reference:
+            entity["ref_latent"] = self.encode_video(batch["reference"].to(self.device).permute(0, 2, 1, 3, 4).float() / 127.5 - 1)
 
         res = self.motion.residuals(
             trajectory, visible, latent_shape, keep_mask=keep, cond_mask=cond_mask, entity=entity
         )
-        # multilayer hooks read this during forward AND during the checkpointed
+        # the hooks read this during forward AND during the checkpointed
         # recompute in backward, so it is deliberately left set after this returns
         self.motion.set_context(res)
-        adapted = self.motion.apply_input(noisy, res) if self.motion.mode == "input" else noisy
 
         pred = self._predict(
-            adapted,
+            noisy,
             sigma.expand(-1, noisy.shape[1]),
             keep,
             self.video_coords(B, latent_shape),
@@ -278,19 +301,59 @@ class LTXBackbone:
 
         target = noise - x0_tokens
         err = ((pred - target) ** 2).mean(dim=-1)  # (B, S)
-        w = (~keep).float()
 
-        focus = self.cfg["train"].get("focus_loss", 0.0) if focus is None else focus
-        if focus > 0:
-            # the trajectory only changes what happens around one object, a few percent of the
-            # tokens; weighting them up raises the share of the gradient that depends on it
+        t = self.cfg["train"]
+        focus = t.get("focus_loss", 0.0) if focus is None else focus
+
+        # where the controlled object is, per latent token, in [0, 1]
+        if "loss_masks" in batch:
+            # the object's TRUE per-frame mask (SAM 2), widened by one cell, on the latent grid.
+            # Training only: nothing here has to exist at inference.
+            lm = batch["loss_masks"].to(self.device).float()               # (B, F, h, w)
+            idx = [min(VAE_TEMPORAL * k, lm.shape[1] - 1) for k in range(Fl)]
+            near = F.adaptive_max_pool2d(lm[:, idx].flatten(0, 1), (Hl, Wl))
+            obj = F.max_pool2d(near, 3, stride=1, padding=1).view(B, Fl, Hl, Wl).reshape(B, -1)
+        elif focus > 0 or return_parts:
             radius = entity["radius"] if entity is not None else torch.full((B,), 0.06, device=self.device)
             fp = entity_footprint(trajectory, visible, radius, Hl, Wl)  # (B, F, Hl, Wl)
             # latent frame k shows video frame 8k (frame 0 is the clean image frame)
             idx = [min(VAE_TEMPORAL * k, fp.shape[1] - 1) for k in range(Fl)]
-            w = w * (1 + focus * fp[:, idx].reshape(B, -1))
+            obj = fp[:, idx].reshape(B, -1)
+        else:
+            obj = None
 
-        return (err * w).sum() / w.sum()
+        valid = (~keep).float()
+        if focus > 0 and obj is not None:
+            # later frames matter most for following the path (the object is furthest from the
+            # conditioning frame there): time_ramp 1 = last frame's object tokens weigh twice the first's
+            ramp = t.get("time_ramp", 0.0)
+            tw = 1.0
+            if ramp > 0:
+                tw = 1 + ramp * torch.linspace(0, 1, Fl, device=self.device).view(1, Fl, 1).expand(1, Fl, Hl * Wl).reshape(1, -1)
+            if t.get("split_loss", False):
+                # object and background are averaged separately, so the object term cannot be diluted by the
+                # (far larger) background, and the background term is an explicit "keep the scene" signal
+                w_obj = valid * obj * tw
+                w_bg = valid * (1 - obj)
+                l_obj = (err * w_obj).sum() / w_obj.sum().clamp(min=1e-6)
+                l_bg = (err * w_bg).sum() / w_bg.sum().clamp(min=1e-6)
+                loss = (focus * l_obj + l_bg) / (focus + 1)
+            else:
+                w = valid * (1 + focus * obj * tw)
+                loss = (err * w).sum() / w.sum()
+        else:
+            loss = (err * valid).sum() / valid.sum()
+
+        if return_parts:
+            # unweighted mean error inside / outside the object, whatever the training weighting is
+            with torch.no_grad():
+                inside, outside = valid * (obj > 0.5).float(), valid * (obj <= 0.5).float()
+                parts = {
+                    "obj": float((err * inside).sum() / inside.sum().clamp(min=1.0)),
+                    "bg": float((err * outside).sum() / outside.sum().clamp(min=1.0)),
+                }
+            return loss, parts
+        return loss
 
     # ------------------------------------------------------------------
     # Inference
@@ -310,14 +373,17 @@ class LTXBackbone:
         motion_guidance=1.0,
         use_motion=True,
         mask=None,
+        ref_init=None,
     ):
         """
         image:      PIL image, already sized (width, height) = cfg data size
         trajectory: (F, 2) normalized, F = cfg num_frames
         motion_guidance: >1 amplifies the trajectory's effect (needs cond_dropout in training)
         use_motion: False runs plain LTX image-to-video (the baseline)
-        mask: (H, W) bool mask of the controlled object in `image` (adapter condition="entity");
+        mask: (H, W) bool mask of the controlled object in `image`;
               a disk around the first trajectory point is used when it is missing
+        ref_init: start the denoising from the drag video (src/reference.py) noised to this sigma (0 = from pure noise;
+                  None = inference.ref_init). Only with use_motion; the baseline never sees it.
         Returns uint8 frames (F, H, W, 3).
         """
         d = self.cfg["data"]
@@ -341,33 +407,35 @@ class LTXBackbone:
         S = Fl * Hl * Wl
 
         keep = self.first_frame_mask(1, latent_shape, self.device)
-        coords = self.video_coords(1, latent_shape, frame_rate=24)
+        coords = self.video_coords(1, latent_shape)
 
         traj = torch.as_tensor(np.asarray(trajectory), dtype=torch.float32, device=self.device)[None]
         vis = torch.as_tensor(np.asarray(visible), dtype=torch.bool, device=self.device)[None]
-        entity = None
-        if self.motion.condition == "entity":
-            if mask is None:
-                mask = disk_mask(H, W, np.asarray(trajectory)[0], 0.06)
-            elif mask.shape != (H, W):
-                mask = np.array(Image.fromarray(mask.astype(np.uint8) * 255).resize((W, H), Image.NEAREST)) > 127
+        if mask is None:
+            mask = disk_mask(H, W, np.asarray(trajectory)[0], 0.06)
+        elif mask.shape != (H, W):
+            mask = np.array(Image.fromarray(mask.astype(np.uint8) * 255).resize((W, H), Image.NEAREST)) > 127
+        mask_t = torch.from_numpy(mask).float().to(self.device)[None, None]
+        image_latent = unpack_latents(img_latent, 1, Hl, Wl)[:, :, 0]
+        entity = self.entity_features(image_latent, mask_t, mask_t.mean().view(1))
 
-            mask_t = torch.from_numpy(mask).float().to(self.device)[None, None]
-            image_latent = unpack_latents(img_latent, 1, Hl, Wl)[:, :, 0]
-            entity = self.entity_features(image_latent, mask_t, mask_t.mean().view(1))
+        if ref_init is None:
+            ref_init = self.cfg["inference"].get("ref_init", 0.0)
+        ref_tokens = None
+        if use_motion and (self.motion.reference or ref_init > 0):
+            drag = render_reference(np.array(image), mask, np.asarray(trajectory), np.asarray(visible))
+            drag = torch.from_numpy(drag).float().div(127.5).sub(1).permute(3, 0, 1, 2)[None]  # 1,3,F,H,W
+            ref_latent = self.encode_video(drag)
+            entity["ref_latent"] = ref_latent
+            ref_tokens = pack_latents(ref_latent)
 
         res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep, entity=entity)
 
         def velocity(x, sig, motion_on):
-            if self.motion.mode == "input":
-                inp = x + res if motion_on else x
-            else:
-                self.motion.set_context(res if motion_on else None)
-                inp = x
-
-            pred = self._predict(inp, sig, keep, coords)
+            self.motion.set_context(res if motion_on else None)
+            pred = self._predict(x, sig, keep, coords)
             if guidance_scale > 1.0:
-                uncond = self._predict(inp, sig, keep, coords, negative=True)
+                uncond = self._predict(x, sig, keep, coords, negative=True)
                 pred = uncond + guidance_scale * (pred - uncond)
             return pred
 
@@ -376,7 +444,15 @@ class LTXBackbone:
 
         sigmas = linear_quadratic_sigmas(steps).to(self.device)
 
-        for i in range(steps):
+        first = 0
+        if ref_tokens is not None and ref_init > 0:
+            # SDEdit-style start: the drag video, noised to sigma = ref_init, instead of pure noise
+            first = int((sigmas[:-1] > ref_init).sum())
+            s0 = float(sigmas[first])
+            x = (1 - s0) * ref_tokens + s0 * torch.randn(ref_tokens.shape, generator=gen, device=self.device)
+            x[:, : img_latent.shape[1]] = img_latent
+
+        for i in range(first, steps):
             s, s_next = sigmas[i], sigmas[i + 1]
             sig = torch.full((1, S), float(s), device=self.device)
 
@@ -405,15 +481,5 @@ class LTXBackbone:
 
     def load_checkpoint(self, path):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-
-        saved = ckpt.get("cfg", {}).get("adapter", {})
-        saved_kind = (saved.get("mode", "input"), saved.get("condition", "points"))
-        if saved_kind != (self.motion.mode, self.motion.condition):
-            raise ValueError(
-                f"checkpoint was trained with adapter {saved_kind} but the model was built with "
-                f"{(self.motion.mode, self.motion.condition)}; pass the checkpoint through "
-                "apply_checkpoint_cfg() first"
-            )
-
         self.motion.load_trainable_state(ckpt)
         return ckpt

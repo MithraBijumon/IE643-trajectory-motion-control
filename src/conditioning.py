@@ -1,92 +1,6 @@
 import torch
+import torch.nn.functional as F
 
-
-def rasterize_trajectories(
-    trajectories,
-    visible,
-    height,
-    width,
-    sigma=0.03,
-    flow_scale=20.0,
-):
-    """
-    trajectories: (B, F, 2) or (B, N, F, 2)
-    visible:      (B, F) or (B, N, F)
-
-    Returns:
-        (B, F, 3, H, W)
-
-    Channels:
-        0 -> point location (heatmap)
-        1 -> x movement
-        2 -> y movement
-    """
-
-    # Add point dimension for single-point input
-    if trajectories.ndim == 3:
-        trajectories = trajectories.unsqueeze(1)
-        visible = visible.unsqueeze(1)
-
-    trajectories = trajectories.float()
-    visible = visible.bool()
-    device = trajectories.device
-
-    # Movement from frame t -> t+1
-    displacement = torch.zeros_like(trajectories)
-    displacement[:, :, :-1] = (
-        trajectories[:, :, 1:] - trajectories[:, :, :-1]
-    )
-
-    valid = torch.zeros_like(visible)
-    valid[:, :, :-1] = visible[:, :, 1:] & visible[:, :, :-1]
-
-    displacement *= valid.unsqueeze(-1)
-    displacement *= flow_scale
-
-    # Normalized pixel coordinates
-    y = (torch.arange(height, device=device) + 0.5) / height
-    x = (torch.arange(width, device=device) + 0.5) / width
-
-    aspect = width / height
-
-    dx = (
-        x.view(1, 1, 1, 1, width)
-        - trajectories[..., 0, None, None]
-    ) * aspect
-
-    dy = (
-        y.view(1, 1, 1, height, 1)
-        - trajectories[..., 1, None, None]
-    )
-
-    # Gaussian around each tracked point
-    heat = torch.exp(
-        -(dx**2 + dy**2) / (2 * sigma**2)
-    )
-
-    heat *= visible[..., None, None]
-
-    # Combine multiple points
-    heat_sum = heat.sum(dim=1).clamp(min=1e-6)
-
-    flow_x = (
-        heat * displacement[..., 0, None, None]
-    ).sum(dim=1) / heat_sum
-
-    flow_y = (
-        heat * displacement[..., 1, None, None]
-    ).sum(dim=1) / heat_sum
-
-    heat = heat.amax(dim=1)
-
-    return torch.stack(
-        [
-            heat,
-            flow_x * heat,
-            flow_y * heat,
-        ],
-        dim=2,
-    )
 
 def entity_footprint(trajectory, visible, radius, grid_height, grid_width, min_sigma=0.75):
     """
@@ -117,6 +31,37 @@ def entity_footprint(trajectory, visible, radius, grid_height, grid_width, min_s
     return torch.exp(-d2 / (2 * sigma**2)) * vis[..., None, None]
 
 
+SHAPE_FACTOR = 4   # the mask is kept at 4x the latent grid, so sub-cell objects keep their shape
+
+
+def shape_footprint(mask, trajectory, visible, grid_height, grid_width, gauss=None, gauss_weight=0.3):
+    """Footprint with the object's real silhouette.
+
+    mask:       (B, 1, SHAPE_FACTOR*grid_height, SHAPE_FACTOR*grid_width) coverage (0-1) of the object in the
+                conditioning frame (the first frame of the clip)
+    trajectory: (B, F, 2) normalized; the silhouette is translated by trajectory[t] - trajectory[0]
+                (rigid, so it can be built at inference from just the first-frame mask)
+    gauss:      optional (B, F, H, W) Gaussian footprint, blended in so a sub-cell object never vanishes
+
+    Returns (B, F, grid_height, grid_width) in [0, 1], zero where the object is hidden.
+    """
+    B, Fr = trajectory.shape[:2]
+    delta = trajectory.float() - trajectory.float()[:, :1]                       # (B, F, 2)
+    theta = torch.zeros(B * Fr, 2, 3, device=mask.device)
+    theta[:, 0, 0] = theta[:, 1, 1] = 1.0
+    theta[:, :, 2] = -2.0 * delta.reshape(-1, 2)                                 # output(p) = input(p - delta)
+    src = mask.float().repeat_interleave(Fr, dim=0)                              # (B*F, 1, Hh, Wh)
+    grid = F.affine_grid(theta, src.shape, align_corners=False)
+    moved = F.grid_sample(src, grid, mode="bilinear", padding_mode="zeros", align_corners=False)
+    pooled = F.avg_pool2d(moved, SHAPE_FACTOR).view(B, Fr, grid_height, grid_width)
+
+    peak = pooled.amax(dim=(-2, -1), keepdim=True).clamp(min=1e-6)
+    fp = pooled / peak                                                           # a small object still reaches 1
+    if gauss is not None:
+        fp = fp + gauss_weight * gauss
+    return fp.clamp(max=1.0) * visible.bool()[..., None, None]
+
+
 def render_entity_condition(
     trajectory,
     visible,
@@ -126,6 +71,7 @@ def render_entity_condition(
     grid_width,
     flow_scale=20.0,
     min_sigma=0.75,
+    shape=None,
 ):
     """
     Entity-aware condition rendered directly on the latent grid.
@@ -147,6 +93,8 @@ def render_entity_condition(
     B = traj.shape[0]
 
     footprint = entity_footprint(traj, vis, radius, grid_height, grid_width, min_sigma)  # (B, F, H, W)
+    if shape is not None:  # real silhouette (translated along the path) instead of a round blob
+        footprint = shape_footprint(shape, traj, vis, grid_height, grid_width, gauss=footprint)
 
     disp = torch.zeros_like(traj)
     disp[:, :-1] = traj[:, 1:] - traj[:, :-1]

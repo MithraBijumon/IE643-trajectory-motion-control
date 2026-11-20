@@ -4,11 +4,13 @@ imageio[ffmpeg]
 Pillow
 pyyaml
 diffusers>=0.34
-transformers
+transformers<5          # 5.x needs torch>=2.6; 4.x works with torch 2.5
 accelerate
 sentencepiece
 protobuf
 gradio
 lpips  # optional: LPIPS image-preservation metric
+simple-aesthetics-predictor  # optional: LAION aesthetic score in benchmark.py
+scipy  # FVD-style Frechet distance
 
 pytest  # optional: python -m pytest tests

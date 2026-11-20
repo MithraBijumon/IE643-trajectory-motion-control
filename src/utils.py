@@ -35,7 +35,7 @@ def apply_checkpoint_cfg(cfg, ckpt_path):
     """Make cfg's adapter settings match the checkpoint that is about to be loaded."""
     if ckpt_path:
         saved = torch.load(ckpt_path, map_location="cpu", weights_only=False).get("cfg", {})
-        cfg["adapter"] = saved.get("adapter", {"mode": "input"})
+        cfg["adapter"] = saved.get("adapter", {})
     return cfg
 
 
@@ -177,4 +177,27 @@ def overlay_trajectory(frames, trajectory, trail=15):
         draw.ellipse([x - 6, y - 6, x + 6, y + 6], fill=(255, 0, 0), outline="black")
         out.append(np.array(img))
 
+    return np.stack(out)
+
+
+def overlay_masks(frames, masks, target=None):
+    """Tint the tracked object masks (T, H, W) bool red on uint8 frames (T, H, W, 3), draw the centroid path so far
+    in cyan and (optionally) the target path in yellow."""
+    out = []
+    H, W = frames.shape[1:3]
+    cents = []
+    for t in range(min(len(frames), len(masks))):
+        frame = frames[t].astype(np.float32)
+        m = masks[t]
+        frame[m] = 0.55 * frame[m] + 0.45 * np.array([255, 40, 40], dtype=np.float32)
+        img = Image.fromarray(frame.astype(np.uint8))
+        draw = ImageDraw.Draw(img)
+        if target is not None:
+            draw.line([(x * W, y * H) for x, y in target], fill=(255, 215, 0), width=2)
+        ys, xs = np.nonzero(m)
+        if len(xs):
+            cents.append((xs.mean(), ys.mean()))
+        if len(cents) > 1:
+            draw.line(cents, fill=(0, 255, 255), width=3)
+        out.append(np.array(img))
     return np.stack(out)
