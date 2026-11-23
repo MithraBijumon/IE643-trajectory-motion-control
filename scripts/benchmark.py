@@ -1,25 +1,14 @@
 """
-benchmark.py
-
 Controlled test of simple motion instructions (left / right / up / down / diagonal).
-For each val image a straight path of fixed length is built from the object's starting
-point, one video is generated per path with the adapter, and one plain-LTX baseline video
-per image. Every video is tracked with CoTracker3 and scored for
+For each val image a straight path is built from the object's starting point; one video is generated per path with the
+adapter and one plain-LTX baseline video per image. Every video is tracked with CoTracker3 / SAM 2 and scored for
+trajectory adherence (ATE, direction, progress, PCK), image preservation and temporal consistency (CLIP, PSNR/SSIM, warp
+error), object-level metrics (obj_*) and unintended background motion (bg_drift, bg_flow).
 
-    trajectory adherence : ATE, final-point error, direction cosine, progress
-    image preservation   : CLIP similarity, first-frame PSNR/SSIM, colour drift (+ LPIPS if installed)
-    temporal consistency : CLIP neighbour similarity, optical-flow warping error (+ temporal LPIPS)
-    object level (SAM 2) : obj_* = tracked object-mask centroid path vs. the target, CLIP similarity of the
-                           object crop to the input object, size drift
-    video quality        : sharpness ratio, LAION aesthetic score, FVD-style distance (VideoMAE features) to real clips
-    PCK@5% / @10%        : fraction of frames where the tracked point is near the target
-    background (bg_*)    : unintended background movement outside the object: bg_drift (change vs. frame 0) and bg_flow
+--seeds 0,1,2 repeats everything per seed; --ood_dir adds clean images from outside the training data
+(<name>.jpg + optional <name>.txt prompt / <name>_mask.png mask).
 
---seeds 0,1,2 repeats everything per seed (reports the spread); --ood_dir adds clean images from outside the training data
-(<name>.jpg + optional <name>.txt prompt / <name>_mask.png mask); --ref_init / --bg_lock switch on the drag-video start and
-the background lock for the adapter runs.
-
-    python scripts/benchmark.py --checkpoint checkpoints/best.pt --num_images 8
+    python scripts/benchmark.py --checkpoint checkpoints/best.pt --num_images 8 --adapter_scale 3
     python scripts/benchmark.py --tiny --checkpoint <tiny ckpt> --num_images 1 --motions left,up
 """
 
@@ -30,35 +19,22 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
-sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
 import numpy as np
 from PIL import Image, ImageDraw
 
-from src.dataset import collect_prompts, read_caption, shift_mask
+from src.dataset import read_caption, shift_mask
 from src.ltx_wrapper import LTXBackbone
-from src.metrics import (AestheticScorer, VideoFeatures, VideoQuality, background_motion, frechet_distance,
-                         object_appearance, object_trajectory_metrics, trajectory_metrics)
+from src.metrics import (VideoQuality, background_motion, load_cotracker, object_appearance, object_trajectory_metrics,
+                         track_point, trajectory_metrics)
 from src.segmentation import Sam2Tracker
-from src.utils import (
-    DIRECTIONS,
-    apply_checkpoint_cfg,
-    get_device,
-    load_config,
-    linear_path,
-    load_image,
-    overlay_trajectory,
-    save_video,
-)
+from src.utils import DIRECTIONS, apply_checkpoint_cfg, get_device, linear_path, load_config, load_image, overlay_trajectory, save_video
+
 
 def val_items(data_root, num_images, cfg):
     d = cfg["data"]
-    split = os.path.join(data_root, "val")
-    items = []
-    if num_images <= 0:
-        return items
-
-    for name in sorted(os.listdir(split)):
+    split, items = os.path.join(data_root, "val"), []
+    for name in sorted(os.listdir(split)) if num_images > 0 else []:
         folder = os.path.join(split, name)
         if not os.path.exists(os.path.join(folder, "trajectory.npy")):
             continue
@@ -66,18 +42,11 @@ def val_items(data_root, num_images, cfg):
         mask = None
         if os.path.exists(mask_path):
             mask = np.array(Image.open(mask_path).convert("L").resize((d["width"], d["height"]), Image.NEAREST)) > 127
-
-        items.append(
-            {
-                "mask": mask,
-                "group": "val",
-                "name": name,
-                "prompt": read_caption(folder) or None,
-                "video": os.path.join(folder, "video.mp4"),
-                "image": load_image(os.path.join(folder, "image.png"), d["height"], d["width"]),
-                "start": np.load(os.path.join(folder, "trajectory.npy"))[0],
-            }
-        )
+        items.append({
+            "mask": mask, "group": "val", "name": name, "prompt": read_caption(folder) or None,
+            "image": load_image(os.path.join(folder, "image.png"), d["height"], d["width"]),
+            "start": np.load(os.path.join(folder, "trajectory.npy"))[0],
+        })
         if len(items) == num_images:
             break
     return items
@@ -150,7 +119,7 @@ def ood_items(folder, cfg, device):
         ys, xs = np.nonzero(mask)
         tpath = os.path.join(folder, stem + ".txt")
         items.append({
-            "name": "ood_" + stem, "group": "ood", "mask": mask, "image": image, "video": None,
+            "name": "ood_" + stem, "group": "ood", "mask": mask, "image": image,
             "start": np.array([xs.mean() / W, ys.mean() / H], dtype=np.float32),
             "prompt": open(tpath, encoding="utf-8").read().strip() if os.path.exists(tpath) else None,
         })
@@ -166,8 +135,7 @@ def moved_masks(mask, target):
 
 def spread(records, key, seeds):
     """Std over seeds of the per-seed mean of `key`."""
-    per = [np.mean([r[key] for r in records if r["seed"] == s and key in r]) for s in seeds]
-    return float(np.std(per))
+    return float(np.std([np.mean([r[key] for r in records if r["seed"] == s and key in r]) for s in seeds]))
 
 
 def main():
@@ -184,10 +152,9 @@ def main():
     p.add_argument("--steps", type=int, default=None)
     p.add_argument("--motion_guidance", type=float, default=None)
     p.add_argument("--ref_init", type=float, default=None, help="start the adapter runs from the drag video noised to this sigma (e.g. 0.8)")
-    p.add_argument("--bg_lock", type=float, default=None, help="lock the background outside this many object radii (e.g. 2.5)")
-    p.add_argument("--adapter_scale", type=float, default=None, help="strength of the adapter residual at inference (1 = as trained, 0 = off; the drag video / composite still run)")
-    p.add_argument("--adapter_min_sigma", type=float, default=None, help="the adapter acts only while sigma >= this (e.g. 0.4); plain LTX finishes the detail")
-    p.add_argument("--bg_comp", type=float, default=None, help="composite the object-free scene outside this many object radii (e.g. 2.5; needs the drag video)")
+    p.add_argument("--bg_comp", type=float, default=None, help="with the drag video: object-free scene outside this many object radii (e.g. 2.5)")
+    p.add_argument("--adapter_scale", type=float, default=None, help="strength of the adapter residual (1 = as trained, 0 = off)")
+    p.add_argument("--adapter_min_sigma", type=float, default=None, help="the adapter acts only while sigma >= this")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--seeds", default=None, help="comma-separated seeds, e.g. 0,1,2 (overrides --seed)")
     args = p.parse_args()
@@ -199,18 +166,11 @@ def main():
     seeds = [int(s) for s in args.seeds.split(",")] if args.seeds else [args.seed]
 
     cfg = apply_checkpoint_cfg(load_config(args.config, tiny=args.tiny), args.checkpoint)
-    data_root = args.data_root or cfg["data"]["root"]
-    if args.ref_init is not None:
-        cfg["inference"]["ref_init"] = args.ref_init
-    if args.bg_lock is not None:
-        cfg["inference"]["bg_lock"] = args.bg_lock
-    if args.bg_comp is not None:
-        cfg["inference"]["bg_comp"] = args.bg_comp
-    if args.adapter_scale is not None:
-        cfg["inference"]["adapter_scale"] = args.adapter_scale
-    if args.adapter_min_sigma is not None:
-        cfg["inference"]["adapter_min_sigma"] = args.adapter_min_sigma
     inf = cfg["inference"]
+    for key in ("ref_init", "bg_comp", "adapter_scale", "adapter_min_sigma"):
+        if getattr(args, key) is not None:
+            inf[key] = getattr(args, key)
+    data_root = args.data_root or cfg["data"]["root"]
     nF = cfg["data"]["num_frames"]
     steps = args.steps or inf["steps"]
     mg = inf["motion_guidance"] if args.motion_guidance is None else args.motion_guidance
@@ -219,19 +179,14 @@ def main():
     items = val_items(data_root, args.num_images, cfg)
     if args.ood_dir:
         items += ood_items(args.ood_dir, cfg, device)
-    print(f"{len(items)} images ({sum(i['group'] == 'ood' for i in items)} out-of-domain) x {len(motions)} motions x "
-          f"{len(seeds)} seeds | motion_guidance {mg} | ref_init {inf.get('ref_init', 0)} | bg_lock {inf.get('bg_lock', 0)} | bg_comp {inf.get('bg_comp', 0)} | adapter_scale {inf.get('adapter_scale', 1.0)} | adapter_min_sigma {inf.get('adapter_min_sigma', 0.0)}")
-
-    from evaluate import load_cotracker, track_point
+    print(f"{len(items)} images ({sum(i['group'] == 'ood' for i in items)} out-of-domain) x {len(motions)} motions x {len(seeds)} seeds | "
+          f"motion_guidance {mg} | ref_init {inf['ref_init']} | bg_comp {inf['bg_comp']} | adapter_scale {inf['adapter_scale']} | adapter_min_sigma {inf['adapter_min_sigma']}")
 
     backbone = LTXBackbone(cfg, device, prompts=[i["prompt"] for i in items if i["prompt"]])
     if args.checkpoint:
         backbone.load_checkpoint(args.checkpoint)
     cotracker = load_cotracker(device)
     quality = VideoQuality(device)
-    aesthetic = AestheticScorer(device)
-    vfeat = VideoFeatures(device)
-    feats = {"adapter": [], "baseline": [], "real": []}
     tracker = Sam2Tracker(device)   # object-level metrics: SAM 2 follows the frame-0 mask through each generated video
 
     def target_free(frames, mask, img_np, masks, fallback):
@@ -241,8 +196,6 @@ def main():
             out.update(object_appearance(quality, img_np, mask, frames, masks))
         if mask is not None:
             out.update(background_motion(frames, masks if masks is not None else fallback))
-        if aesthetic.ok:
-            out["aesthetic"] = aesthetic.score(frames)
         return out
 
     H, W = cfg["data"]["height"], cfg["data"]["width"]
@@ -260,11 +213,6 @@ def main():
     for item in items:
         name, image, mask, prompt = item["name"], item["image"], item["mask"], item["prompt"]
         img_np = np.array(image)
-        if vfeat.ok and item["video"]:  # the real clip of this val sample = the reference distribution for FVD
-            import imageio.v2 as imageio
-            real = np.stack([np.asarray(f) for f in imageio.mimread(item["video"], memtest=False)][:nF])
-            feats["real"].append(vfeat(real))
-
         for seed in seeds:
             sfx = f"_s{seed}" if len(seeds) > 1 else ""
             # one baseline video per (image, seed); it is scored against every target path
@@ -275,8 +223,6 @@ def main():
             base_masks = tracker.track(base_frames, mask) if (tracker.ok and mask is not None) else None
             base_common = {**quality.score(img_np, base_frames),
                            **target_free(base_frames, mask, img_np, base_masks, np.repeat(mask[None], nF, 0) if mask is not None else None)}
-            if vfeat.ok:
-                feats["baseline"].append(vfeat(base_frames))
 
             for motion in motions:
                 target = linear_path(item["start"], DIRECTIONS[motion], args.length, nF)
@@ -294,8 +240,6 @@ def main():
                     row.update(object_trajectory_metrics(target, masks))
                 if base_masks is not None:
                     base_row.update(object_trajectory_metrics(target, base_masks))
-                if vfeat.ok and motion == motions[0]:
-                    feats["adapter"].append(vfeat(frames))
                 records["adapter"].append(row)
                 records["baseline"].append(base_row)
 
@@ -318,28 +262,16 @@ def main():
         summary["seed_std"] = {label: {k: spread(rows, k, seeds) for k in keys if any(k in r for r in rows)}
                                for label, rows in records.items()}
 
-    # FVD-style distance (VideoMAE features) to the real val clips; only meaningful with enough videos
-    if vfeat.ok and len(feats["real"]) >= 2:
-        fvd = {}
-        for label in ("baseline", "adapter"):
-            if len(feats[label]) >= 2:
-                fvd[label] = frechet_distance(np.stack(feats[label]), np.stack(feats["real"]))
-        summary["fvd_videomae"] = fvd
-        summary["fvd_n"] = {k: len(v) for k, v in feats.items()}
-
     os.makedirs(args.out, exist_ok=True)
     with open(os.path.join(args.out, "results.json"), "w") as f:
-        json.dump({"args": vars(args), "adapter_mode": "multilayer/entity", "summary": summary, "records": records}, f, indent=2)
+        json.dump({"args": vars(args), "summary": summary, "records": records}, f, indent=2)
     if montage_rows:
         montage(montage_rows, montage_labels, os.path.join(args.out, "montage.png"))
 
     cols = ["ate", "epe_final", "pck_5", "pck_10", "direction_cos", "progress",
-            "clip_image_sim", "first_frame_psnr", "first_frame_ssim", "color_drift",
-            "clip_temporal", "warp_error", "sharpness_ratio", "aesthetic",
+            "clip_image_sim", "first_frame_psnr", "first_frame_ssim", "color_drift", "clip_temporal", "warp_error", "sharpness_ratio",
             "obj_ate", "obj_direction_cos", "obj_progress", "obj_clip_sim", "obj_area_ratio", "bg_drift", "bg_flow"]
-    for k in ("lpips_to_input", "lpips_temporal"):
-        if k in summary["overall"]["adapter"]:
-            cols.append(k)
+    short = ["ate", "direction_cos", "progress", "obj_ate", "obj_direction_cos", "bg_drift", "bg_flow"]
 
     def table(rowsets, columns, first="method"):
         lines = [f"| {first} | " + " | ".join(columns) + " |", "|---|" + "---|" * len(columns)]
@@ -351,7 +283,6 @@ def main():
     if len(groups) > 1:
         out += ["", "## by image group (val = held-out clips, ood = clean out-of-domain images)",
                 table([(f"{l} / {g}", summary["by_group"][l][g]) for g in groups for l in ("baseline", "adapter")], cols)]
-    short = ["ate", "direction_cos", "progress", "obj_ate", "obj_direction_cos", "bg_drift", "bg_flow"]
     out += ["", "## per motion (opposite directions show forward / backward asymmetry)",
             table([(f"{l} / {m}", summary["per_motion"][l][m]) for m in motions for l in ("baseline", "adapter")], short)]
     if "seed_std" in summary:

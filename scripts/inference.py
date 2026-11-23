@@ -1,6 +1,4 @@
 """
-inference.py
-
 Generate a video from a first-frame image and a target trajectory.
 
     # from a preprocessed sample folder (image.png + trajectory.npy [+ visibility.npy])
@@ -102,7 +100,6 @@ def main():
     p.add_argument("--guidance", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--motion_guidance", type=float, default=None, help=">1 amplifies the trajectory")
-    p.add_argument("--bg_lock", type=float, default=None, help="lock the background outside this many object radii (e.g. 2.5)")
     p.add_argument("--adapter_scale", type=float, default=None, help="strength of the adapter residual at inference (1 = as trained, 0 = off; the drag video / composite still run)")
     p.add_argument("--adapter_min_sigma", type=float, default=None, help="the adapter acts only while sigma >= this (e.g. 0.4); plain LTX finishes the detail")
     p.add_argument("--bg_comp", type=float, default=None, help="composite the object-free scene outside this many object radii (e.g. 2.5)")
@@ -115,16 +112,9 @@ def main():
         p.error("give --sample_dir, or both --image and --trajectory")
 
     cfg = apply_checkpoint_cfg(load_config(args.config, tiny=args.tiny), args.checkpoint)
-    if args.ref_init is not None:
-        cfg["inference"]["ref_init"] = args.ref_init
-    if args.bg_lock is not None:
-        cfg["inference"]["bg_lock"] = args.bg_lock
-    if args.bg_comp is not None:
-        cfg["inference"]["bg_comp"] = args.bg_comp
-    if args.adapter_scale is not None:
-        cfg["inference"]["adapter_scale"] = args.adapter_scale
-    if args.adapter_min_sigma is not None:
-        cfg["inference"]["adapter_min_sigma"] = args.adapter_min_sigma
+    for key in ("ref_init", "bg_comp", "adapter_scale", "adapter_min_sigma"):
+        if getattr(args, key) is not None:
+            cfg["inference"][key] = getattr(args, key)
     prompt = args.prompt or (read_caption(args.sample_dir) if args.sample_dir else "") or None
     backbone = LTXBackbone(cfg, get_device(), prompts=[prompt] if prompt else None)
 

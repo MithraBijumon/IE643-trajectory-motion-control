@@ -172,7 +172,7 @@ def sharpness(frames):
 # ---------------------------------------------------------------------
 
 class VideoQuality:
-    """CLIP-based scores, plus LPIPS when the `lpips` package is installed."""
+    """CLIP-based and pixel-level scores of a generated video against its input image."""
 
     def __init__(self, device):
         from transformers import CLIPModel, CLIPProcessor
@@ -180,13 +180,6 @@ class VideoQuality:
         self.device = device
         self.model = CLIPModel.from_pretrained(CLIP_ID).to(device).eval()
         self.processor = CLIPProcessor.from_pretrained(CLIP_ID)
-
-        try:
-            import lpips
-
-            self.lpips = lpips.LPIPS(net="alex", verbose=False).to(device).eval()
-        except Exception:
-            self.lpips = None
 
     @torch.no_grad()
     def embed(self, frames):
@@ -223,85 +216,22 @@ class VideoQuality:
         # video quality (no reference): sharpness relative to the input image's own sharpness
         out["sharpness_ratio"] = sharpness(frames) / max(sharpness(input_image[None]), 1e-6)
 
-        if self.lpips is not None:
-            def prep(x):
-                return torch.from_numpy(x).permute(0, 3, 1, 2).float().div(127.5).sub(1).to(self.device)
-
-            ref_t = prep(input_image[None]).expand(len(frames) - 1, -1, -1, -1)
-            out["lpips_to_input"] = float(self.lpips(prep(frames[1:]), ref_t).mean())
-            out["lpips_temporal"] = float(self.lpips(prep(frames[1:]), prep(frames[:-1])).mean())
-
         return out
 
 
 # ---------------------------------------------------------------------
-# Aesthetics (LAION aesthetic predictor v2, optional) and FVD-style distribution distance
+# CoTracker3: where does a point go in a video
 # ---------------------------------------------------------------------
 
-AESTHETIC_CLIP = "openai/clip-vit-large-patch14"
-AESTHETIC_HEAD = "shunk031/aesthetics-predictor-v2-sac-logos-ava1-l14-linearMSE"
-VIDEO_FEATURE_MODEL = "MCG-NJU/videomae-base"
+def load_cotracker(device):
+    return torch.hub.load("facebookresearch/co-tracker", "cotracker3_offline").to(device)
 
 
-class AestheticScorer:
-    """LAION aesthetic predictor v2 (CLIP ViT-L/14 + linear head, ~1-10, higher = prettier), averaged over
-    up to `max_frames` frames. Needs `pip install simple-aesthetics-predictor`; `.ok` is False if the
-    package or weights are unavailable, and callers should then skip the metric."""
-
-    def __init__(self, device, max_frames=8):
-        self.device, self.max_frames, self.ok = device, max_frames, False
-        try:
-            from aesthetics_predictor import AestheticsPredictorV2Linear
-            from transformers import CLIPProcessor
-
-            self.model = AestheticsPredictorV2Linear.from_pretrained(AESTHETIC_HEAD).to(device).eval()
-            self.processor = CLIPProcessor.from_pretrained(AESTHETIC_CLIP)
-            self.ok = True
-        except Exception as e:  # missing package / no network: the benchmark just leaves the column out
-            print(f"[aesthetics] unavailable ({type(e).__name__}: {e})")
-
-    @torch.no_grad()
-    def score(self, frames):
-        idx = np.linspace(0, len(frames) - 1, min(self.max_frames, len(frames))).round().astype(int)
-        inputs = self.processor(images=[frames[i] for i in idx], return_tensors="pt").to(self.device)
-        return float(self.model(**inputs).logits.float().mean())
-
-
-def frechet_distance(a, b):
-    """Frechet distance between two feature sets (N1, D), (N2, D). Needs N >= 2 each; with N << D the
-    covariances are rank-deficient, so only compare values computed with the same N."""
-    from scipy import linalg
-
-    mu1, mu2 = a.mean(0), b.mean(0)
-    s1, s2 = np.cov(a, rowvar=False), np.cov(b, rowvar=False)
-    covmean, _ = linalg.sqrtm(s1.dot(s2), disp=False)
-    if not np.isfinite(covmean).all():
-        eps = np.eye(s1.shape[0]) * 1e-6
-        covmean = linalg.sqrtm((s1 + eps).dot(s2 + eps))
-    covmean = covmean.real
-    return float(((mu1 - mu2) ** 2).sum() + np.trace(s1) + np.trace(s2) - 2 * np.trace(covmean))
-
-
-class VideoFeatures:
-    """Clip-level features for an FVD-style score. The classic FVD uses I3D (needs a separate weight
-    download); this uses VideoMAE-base (16 frames -> mean token, 768-d), so numbers are NOT comparable with
-    published FVD, only between runs/methods of this project."""
-
-    def __init__(self, device):
-        self.ok = False
-        try:
-            from transformers import VideoMAEImageProcessor, VideoMAEModel
-
-            self.device = device
-            self.model = VideoMAEModel.from_pretrained(VIDEO_FEATURE_MODEL).to(device).eval()
-            self.processor = VideoMAEImageProcessor.from_pretrained(VIDEO_FEATURE_MODEL)
-            self.ok = True
-        except Exception as e:
-            print(f"[fvd] unavailable ({type(e).__name__}: {e})")
-
-    @torch.no_grad()
-    def __call__(self, frames):
-        """uint8 (T, H, W, 3) -> (768,) numpy"""
-        idx = np.linspace(0, len(frames) - 1, 16).round().astype(int)
-        inputs = self.processor([frames[i] for i in idx], return_tensors="pt").to(self.device)
-        return self.model(**inputs).last_hidden_state.float().mean(1)[0].cpu().numpy()
+def track_point(cotracker, frames, start_xy_pixels, device):
+    """Track one point from frame 0 through uint8 frames (T, H, W, 3); returns (T, 2) normalized to [0, 1]."""
+    T, H, W, _ = frames.shape
+    video = torch.tensor(frames).permute(0, 3, 1, 2)[None].float().to(device)
+    queries = torch.tensor([[0.0, start_xy_pixels[0], start_xy_pixels[1]]], device=device)[None]
+    with torch.no_grad():
+        tracks, _ = cotracker(video, queries=queries)
+    return tracks[0, :, 0].cpu().numpy() / np.array([W, H])

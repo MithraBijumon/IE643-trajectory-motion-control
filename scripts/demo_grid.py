@@ -1,14 +1,12 @@
 """
-demo_grid.py
 Quick visual check: the same val clips and the same straight path, generated with several variants, in one contact sheet
 (rows = clip x variant, columns = first / middle / last frame, target path drawn). Loads the model once.
 
-    python scripts/demo_grid.py --config configs/ltx2b.yaml --num 3 --direction right \
+    python scripts/demo_grid.py --num 3 --direction right \
         --variants base,adapter,ref0.8,ref0.8+comp2.5 [--checkpoint <best.pt>]
 
 A variant is "base" (plain LTX, no adapter) or "adapter" plus options joined with "+":
     ref0.8    start denoising from the drag video noised to sigma 0.8 (training-free; works without a checkpoint)
-    lock2.5   background lock: outside 2.5 object radii the velocity is plain LTX's (keeps whatever plain LTX shows, ghosts included)
     comp2.5   scene composite: outside 2.5 object radii the tokens are the drag video's object-free scene (removes the old copy)
     as0.3     adapter strength 0.3 of what was trained (as0 = adapter off but drag video/composite on: the training-free path
               with the same checkpoint loaded; every variant except 'base' otherwise uses the adapter when --checkpoint is given)
@@ -26,21 +24,16 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "scripts"))
 
-import numpy as np
-from PIL import Image
-
 from benchmark import draw_row, montage, val_items
 from src.ltx_wrapper import LTXBackbone
 from src.utils import DIRECTIONS, apply_checkpoint_cfg, get_device, linear_path, load_config, save_video
 
 
 def parse(variant):
-    opts = {"use_motion": variant != "base", "ref_init": 0.0, "bg_lock": 0.0, "bg_comp": 0.0, "motion_guidance": 1.0, "release": None, "adapter_scale": None, "adapter_min_sigma": None}
+    opts = {"use_motion": variant != "base", "ref_init": 0.0, "bg_comp": 0.0, "motion_guidance": 1.0, "release": None, "adapter_scale": None, "adapter_min_sigma": None}
     for part in variant.split("+")[0:]:
         if part.startswith("ref"):
             opts["ref_init"] = float(part[3:])
-        elif part.startswith("lock"):
-            opts["bg_lock"] = float(part[4:])
         elif part.startswith("comp"):
             opts["bg_comp"] = float(part[4:])
         elif part.startswith("as"):

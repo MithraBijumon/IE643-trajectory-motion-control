@@ -7,7 +7,6 @@ import torch.nn.functional as F_nn
 from PIL import Image
 from torch.utils.data import Dataset
 
-from src.reference import render_reference
 from src.segmentation import disk_mask
 
 
@@ -25,15 +24,11 @@ class TrajectoryDataset(Dataset):
         repeat=1,
         augment=False,
         mask_loss=True,
-        reference=False,
         captions=True,
-        speed_aug=True,
     ):
         # augment (train only): a random tracked point per visit (tracks.npy) and a random mirror flip
         self.augment = augment
-        self.speed_aug = speed_aug  # augment: sometimes take every 2nd frame (2x faster motion); False = the earlier behaviour
         self.captions = captions  # use <clip>/caption.txt (scripts/caption_clips.py) as the clip's own text prompt
-        self.reference = reference  # also return a rendered "drag video" (src/reference.py) as an extra condition
         self.mask_loss = mask_loss  # False: SAM 2 masks only on the INPUT side (conditioning frame), never to weight the loss
         self.repeat = repeat  # visit every clip this many times per epoch (each visit = a new random crop)
         self.default_radius = default_radius
@@ -65,10 +60,8 @@ class TrajectoryDataset(Dataset):
         name, folder, length = self.samples[idx % len(self.samples)]
         F = self.num_frames
 
-        # augment: sometimes take every 2nd frame (2x faster motion) when the clip is long enough
-        stride = 2 if self.augment and self.speed_aug and self.random_crop and length > 2 * (F - 1) and np.random.rand() < 0.5 else 1
-        start = np.random.randint(0, length - (F - 1) * stride) if self.random_crop else 0
-        ids = start + stride * np.arange(F)
+        start = np.random.randint(0, length - F + 1) if self.random_crop else 0
+        ids = start + np.arange(F)
 
         full_trajectory = np.load(os.path.join(folder, "trajectory.npy"))
         trajectory = full_trajectory[ids]
@@ -152,11 +145,6 @@ class TrajectoryDataset(Dataset):
 
             item["mask"] = torch.from_numpy(mask).float().unsqueeze(0)  # (1, H, W)
             item["mask_area"] = torch.tensor(area, dtype=torch.float32)
-
-            if self.reference:
-                image_np = ((video[0].permute(1, 2, 0) + 1) * 127.5).round().clamp(0, 255).byte().numpy()
-                ref = render_reference(image_np, mask, trajectory, visible)  # all of these are already mirrored
-                item["reference"] = torch.from_numpy(ref).permute(0, 3, 1, 2).contiguous()  # (F, 3, H, W) uint8
 
         return item
 

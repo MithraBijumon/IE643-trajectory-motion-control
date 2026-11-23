@@ -1,9 +1,8 @@
 """
-trace_example.py
-One example traced end to end, for the report: input image + object mask + drawn path -> drag video -> generated frames
+One example traced end to end: input image + object mask + drawn path -> drag video -> generated frames
 with the SAM 2 mask and centroid path -> the metrics, each with what it measures. Plain LTX is shown for comparison.
 
-    python scripts/trace_example.py --config configs/ltx2b.yaml --checkpoint best.pt --direction right --ref_init 0.8 [--clip <val clip>]
+    python scripts/trace_example.py --checkpoint best.pt --direction right --ref_init 0.8 [--clip <val clip>]
 """
 
 import argparse
@@ -22,7 +21,7 @@ from PIL import Image, ImageDraw
 
 from benchmark import val_items
 from src.ltx_wrapper import LTXBackbone
-from src.metrics import background_motion, object_trajectory_metrics, trajectory_metrics
+from src.metrics import background_motion, load_cotracker, object_trajectory_metrics, track_point, trajectory_metrics
 from src.reference import render_reference
 from src.segmentation import Sam2Tracker
 from src.utils import DIRECTIONS, apply_checkpoint_cfg, get_device, linear_path, load_config, overlay_masks, save_video
@@ -47,7 +46,6 @@ def main():
     p.add_argument("--direction", default="right", choices=list(DIRECTIONS))
     p.add_argument("--length", type=float, default=0.3)
     p.add_argument("--ref_init", type=float, default=None)
-    p.add_argument("--bg_lock", type=float, default=None)
     p.add_argument("--bg_comp", type=float, default=None)
     p.add_argument("--adapter_scale", type=float, default=None)
     p.add_argument("--adapter_min_sigma", type=float, default=None)
@@ -71,12 +69,11 @@ def main():
     opts = dict(steps=args.steps or inf["steps"], guidance_scale=inf["guidance_scale"], decode_timestep=inf["decode_timestep"],
                 seed=args.seed, mask=item["mask"], prompt=item["prompt"])
     base = backbone.generate(item["image"], target, use_motion=False, **opts)
-    gen = backbone.generate(item["image"], target, use_motion=True, ref_init=args.ref_init, bg_lock=args.bg_lock, bg_comp=args.bg_comp, adapter_scale=args.adapter_scale, adapter_min_sigma=args.adapter_min_sigma,
+    gen = backbone.generate(item["image"], target, use_motion=True, ref_init=args.ref_init, bg_comp=args.bg_comp, adapter_scale=args.adapter_scale, adapter_min_sigma=args.adapter_min_sigma,
                             motion_guidance=args.motion_guidance if args.motion_guidance is not None else inf["motion_guidance"], **opts)
     drag = render_reference(np.array(item["image"]), item["mask"], target)
 
     tracker = Sam2Tracker(device)
-    from evaluate import load_cotracker, track_point
     cot = load_cotracker(device)
     H, W = gen.shape[1:3]
     scores = {}

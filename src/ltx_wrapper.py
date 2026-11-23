@@ -70,8 +70,7 @@ class LTXBackbone:
             cond_blocks=a.get("cond_blocks", 0),
             cond_heads=a.get("cond_heads", 4),
             local_inject=a.get("local_inject", 0.0),
-            reference=a.get("reference", False),
-            cap=a.get("inject_cap", "global"),     # old checkpoints/configs have no key: they keep the old global cap
+            cap=a.get("inject_cap", "global"),
         ).to(self.device)
         self.motion.attach(self.transformer)
 
@@ -277,16 +276,10 @@ class LTXBackbone:
     # Training
     # ------------------------------------------------------------------
 
-    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None, return_parts=False, sde=None):
-        """use_condition: None = normal (with condition dropout), True/False = force the
-        trajectory on/off for every sample (used to measure what the trajectory is worth).
-        focus: extra loss weight on the tokens around the controlled object, w = 1 + focus * footprint
-        (None = train.focus_loss from the config, 0 = plain mean). Validation passes 0 so that
-        cond_gain stays comparable between runs.
-        return_parts: also return {"obj": ..., "bg": ...}, the plain mean error inside / outside the object mask.
-        sde: None = SDEdit-style samples at random with probability train.sde_prob (training only); True = ALL samples start from the
-             noised drag video (with `sigma` pinned: clamped into [sde_min, sde_max]) - the validation that matches --ref_init
-             generation; False = never."""
+    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None, return_parts=False):
+        """use_condition: None = normal (with condition dropout), True/False = force the trajectory on/off for every sample.
+        focus: extra loss weight on the object tokens (None = train.focus_loss; 0 = plain mean, used by validation).
+        sigma: pin the noise level (validation). return_parts: also return the plain mean error {"obj", "bg"}."""
         video = batch["video"].permute(0, 2, 1, 3, 4)  # B,F,3,H,W -> B,3,F,H,W
         trajectory = batch["trajectory"].to(self.device)
         visible = batch["visible"].to(self.device)
@@ -302,8 +295,6 @@ class LTXBackbone:
         # train.sigma_mean > 0 shifts it towards noisier steps, where the motion is decided
         mean = self.cfg["train"].get("sigma_mean", 0.0)
         drawn = torch.sigmoid(torch.randn(B, 1, generator=generator, device=self.device) + mean)
-        # `sigma` (a float in (0, 1)) pins the noise level, e.g. for a validation grid
-        sigma_pinned = sigma is not None
         sigma = drawn if sigma is None else torch.full_like(drawn, float(sigma))
         keep = self.first_frame_mask(B, latent_shape, self.device)
 
@@ -322,29 +313,7 @@ class LTXBackbone:
             training=use_condition is None,  # embedding dropout only in real training steps, not in validation
         )
 
-        if self.motion.reference:
-            entity["ref_latent"] = self.encode_video(batch["reference"].to(self.device).permute(0, 2, 1, 3, 4).float() / 127.5 - 1)
-
         target = noise - x0_tokens
-        sigma_in = sigma
-        sde_p = 1.0 if sde is True else (0.0 if sde is False else self.cfg["train"].get("sde_prob", 0.0))
-        if sde_p > 0 and (use_condition is None or sde is True) and self.motion.reference:
-            # SDEdit-style samples, the situation of --ref_init at inference: the input is the NOISED DRAG VIDEO (pasted object,
-            # filled hole) and the target is the velocity that leads from it to the real clip. The adapter then learns to repaint
-            # the drag video into a real video instead of only seeing noised real footage.
-            sde_rows = torch.rand(B, 1, 1, generator=generator, device=self.device) < sde_p
-            lo, hi = self.cfg["train"].get("sde_min", 0.35), self.cfg["train"].get("sde_max", 0.8)
-            # SDE samples get their own noise level in [lo, hi] (where --ref_init starts and early steps run): at small sigma the
-            # drag video differs a lot from the real clip and the target (x_sigma - x0)/sigma explodes; there normal samples train.
-            s = (lo + (hi - lo) * torch.rand(B, 1, 1, generator=generator, device=self.device))   # (B, 1, 1)
-            if sigma_pinned:                                                                        # validation grid: a fixed level
-                s = torch.full_like(s, min(max(float(sigma[0, 0]), lo), hi))
-            from_ref = (1 - s) * pack_latents(entity["ref_latent"]) + s * noise
-            from_ref = torch.where(keep.unsqueeze(-1), x0_tokens, from_ref)
-            to_real = (from_ref - x0_tokens) / s                                                    # x0 = x_sigma - sigma * velocity
-            noisy = torch.where(sde_rows, from_ref, noisy)
-            target = torch.where(sde_rows, to_real, target)
-            sigma_in = torch.where(sde_rows.squeeze(-1), s.squeeze(-1), sigma)
 
         res = self.motion.residuals(
             trajectory, visible, latent_shape, keep_mask=keep, cond_mask=cond_mask, entity=entity
@@ -355,7 +324,7 @@ class LTXBackbone:
 
         pred = self._predict(
             noisy,
-            sigma_in.expand(-1, noisy.shape[1]),
+            sigma.expand(-1, noisy.shape[1]),
             keep,
             self.video_coords(B, latent_shape),
             captions=batch.get("caption"),
@@ -436,30 +405,20 @@ class LTXBackbone:
         mask=None,
         ref_init=None,
         prompt=None,
-        bg_lock=None,
         bg_comp=None,
         adapter_scale=None,
         adapter_min_sigma=None,
     ):
         """
-        image:      PIL image, already sized (width, height) = cfg data size
-        trajectory: (F, 2) normalized, F = cfg num_frames
-        motion_guidance: >1 amplifies the trajectory's effect (needs cond_dropout in training)
-        use_motion: False runs plain LTX image-to-video (the baseline)
-        mask: (H, W) bool mask of the controlled object in `image`;
-              a disk around the first trajectory point is used when it is missing
-        bg_lock: >0 locks the background: outside a footprint of this many object radii the velocity is exactly that of
-                 plain LTX (one extra forward pass per step), so only the object's surroundings can change. None = inference.bg_lock
-        bg_comp: >0 composites the scene: outside a footprint of this many object radii (along the path) the tokens are replaced at
-                 every step (until sigma drops below inference.bg_comp_release) by the drag video's object-free scene, so the
-                 original object cannot linger at its old place. Needs/uses the drag video. None = inference.bg_comp
-        adapter_scale: strength of the adapter's residual (1 = as trained, 0 = off but the drag video / composite still run, which
-                       is the training-free path with the same checkpoint loaded). None = inference.adapter_scale (1)
-        adapter_min_sigma: the adapter acts only while sigma >= this; below it plain LTX finishes the fine detail (motion is decided at
-                           high noise). 0 = always on. None = inference.adapter_min_sigma
-        prompt: text prompt for this image (encoded on first use); None = the config prompt
-        ref_init: start the denoising from the drag video (src/reference.py) noised to this sigma (0 = from pure noise;
-                  None = inference.ref_init). Only with use_motion; the baseline never sees it.
+        image: PIL image sized (width, height); trajectory: (F, 2) normalized, F = num_frames.
+        motion_guidance: >1 amplifies the trajectory's effect (needs cond_dropout in training).
+        use_motion: False runs plain LTX image-to-video (the baseline).
+        mask: (H, W) bool mask of the object (a disk at the first trajectory point if missing).
+        adapter_scale: strength of the adapter residual (1 = as trained, 0 = off).
+        adapter_min_sigma: the adapter acts only while sigma >= this (0 = always).
+        ref_init: start from the drag video (src/reference.py) noised to this sigma (0 = pure noise).
+        bg_comp: >0 puts the drag video's object-free scene back outside this many object radii, until sigma < bg_comp_release.
+        prompt: text for this image (None = the config prompt). None for the options above = the inference config value.
         Returns uint8 frames (F, H, W, 3).
         """
         d = self.cfg["data"]
@@ -504,18 +463,13 @@ class LTXBackbone:
         if bg_comp is None:
             bg_comp = self.cfg["inference"].get("bg_comp", 0.0)
         ref_tokens = None
-        if use_motion and (self.motion.reference or ref_init > 0 or bg_comp > 0):
+        if use_motion and (ref_init > 0 or bg_comp > 0):
             drag = render_reference(np.array(image), mask, np.asarray(trajectory), np.asarray(visible))
             drag = torch.from_numpy(drag).float().div(127.5).sub(1).permute(3, 0, 1, 2)[None]  # 1,3,F,H,W
-            ref_latent = self.encode_video(drag)
-            entity["ref_latent"] = ref_latent
-            ref_tokens = pack_latents(ref_latent)
+            ref_tokens = pack_latents(self.encode_video(drag))
 
         res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep, entity=entity) if use_motion else None
 
-        if bg_lock is None:
-            bg_lock = self.cfg["inference"].get("bg_lock", 0.0)
-        near = self.motion.near_object(traj, vis, latent_shape, entity, scale=bg_lock) if (use_motion and bg_lock > 0) else None
         comp_near = self.motion.near_object(traj, vis, latent_shape, entity, scale=bg_comp) if (use_motion and bg_comp > 0) else None
         release = self.cfg["inference"].get("bg_comp_release", 0.25)
         if adapter_scale is None:
@@ -552,12 +506,9 @@ class LTXBackbone:
 
             on = use_motion and float(s) >= adapter_min_sigma
             pred = velocity(x, sig, on)
-            if use_motion and (motion_guidance != 1.0 or near is not None):
+            if use_motion and motion_guidance != 1.0:
                 off = velocity(x, sig, False)
-                if motion_guidance != 1.0:
-                    pred = off + motion_guidance * (pred - off)
-                if near is not None:
-                    pred = off + near * (pred - off)   # background tokens follow the plain-LTX velocity
+                pred = off + motion_guidance * (pred - off)
 
             # pred is the velocity (noise - x0); sigma decreases, so s_next - s < 0
             x_new = x + (s_next - s) * pred

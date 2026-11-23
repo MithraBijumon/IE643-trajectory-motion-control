@@ -45,25 +45,15 @@ class MotionControl(nn.Module):
     """
 
     def __init__(self, dim=128, num_blocks=0, hidden_dim=0, inject_every=4, relative=False, max_inject=0.0,
-                 cond_blocks=0, cond_heads=4, local_inject=0.0, reference=False, cap="global"):
+                 cond_blocks=0, cond_heads=4, local_inject=0.0, cap="global"):
         super().__init__()
-        # >0: inject only around the object: the residual is multiplied by a Gaussian footprint whose radius is
-        # local_inject x the object's radius (the background stays exactly as LTX would produce it). 0 = everywhere
-        self.local_inject = local_inject
-        # reference: the VAE latents of a rendered "drag video" (src/reference.py) are added to the encoded condition,
-        # a pixel-aligned hint of what the output should look like (like a ControlNet's canny / depth image)
-        self.reference = reference
-        if reference:
-            self.ref_proj = nn.Conv3d(dim, 128, 1)
-            nn.init.zeros_(self.ref_proj.weight)   # the drag video joins the condition gradually (ControlNet-style zero init)
-            nn.init.zeros_(self.ref_proj.bias)
-        self.relative = relative  # inject in units of the hidden state's own RMS (absolute injection is easily drowned out)
-        self.max_inject = max_inject  # never inject more than this fraction of the hidden RMS (0 = no cap)
-        # cap = "global": the cap bounds the RMS over ALL tokens. With local_inject most tokens get 0, so inside the footprint a token
-        #                 can receive many times max_inject (a 4% footprint at cap 0.05 -> ~25% per token, at every injection point).
-        # cap = "token":  the cap bounds every token's own residual: no hot spot, whatever the object's size.
+        self.local_inject = local_inject  # >0: inject only near the object (Gaussian footprint, radius = local_inject x the object's); 0 = everywhere
+        self.relative = relative          # inject in units of the hidden state's own RMS
+        self.max_inject = max_inject      # never inject more than this fraction of the hidden RMS (0 = no cap)
+        # cap "global" bounds the RMS over ALL tokens (with local injection, tokens in the footprint can get many times max_inject);
+        # cap "token" bounds every token on its own
         self.cap = cap
-        self.scale = 1.0   # inference dial for the adapter's strength (1 = as trained, 0 = off); not trained
+        self.scale = 1.0                  # inference dial for the adapter's strength (1 = as trained, 0 = off); not trained
         self.condition_encoder = EntityConditionEncoder(in_channels=3 + dim)
         # small randomly initialised transformer blocks: the condition tokens see each other before injection
         self.cond_blocks = nn.ModuleList([
@@ -93,8 +83,6 @@ class MotionControl(nn.Module):
         latent = self.condition_encoder(condition)
         if latent.shape[2:] != (Fl, Hl, Wl):
             latent = F.interpolate(latent, size=(Fl, Hl, Wl), mode="trilinear", align_corners=False)
-        if self.reference:
-            latent = latent + self.ref_proj(entity["ref_latent"].to(latent.dtype))  # (B, 128, F', H', W')
 
         tokens = pack_latents(latent)
         if len(self.cond_blocks):
@@ -185,8 +173,6 @@ class MotionControl(nn.Module):
         state = {"condition_encoder": self.condition_encoder.state_dict(), "projs": self.projs.state_dict()}
         if len(self.cond_blocks):
             state["cond_blocks"] = self.cond_blocks.state_dict()
-        if self.reference:
-            state["ref_proj"] = self.ref_proj.state_dict()
         return state
 
     def load_trainable_state(self, state):
@@ -196,7 +182,3 @@ class MotionControl(nn.Module):
             if "cond_blocks" not in state:
                 raise ValueError("checkpoint has no cond_blocks but the model was built with them")
             self.cond_blocks.load_state_dict(state["cond_blocks"])
-        if self.reference:
-            if "ref_proj" not in state:
-                raise ValueError("checkpoint was trained without the reference condition")
-            self.ref_proj.load_state_dict(state["ref_proj"])

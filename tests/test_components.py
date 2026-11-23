@@ -260,16 +260,6 @@ def test_extra_quality_metrics():
     assert trajectory_metrics(t, t)["pck_5"] == 1.0
 
 
-def test_frechet_distance():
-    import numpy as np
-    from src.metrics import frechet_distance
-
-    rng = np.random.default_rng(0)
-    a = rng.normal(size=(40, 8))
-    assert frechet_distance(a, a) < 1e-6
-    assert frechet_distance(a, a + 3.0) > 50
-
-
 def _tiny_batch(nf=17, h=64, w=96):
     import torch
 
@@ -287,7 +277,6 @@ def _tiny_batch(nf=17, h=64, w=96):
         "mask": mask,
         "mask_area": torch.tensor([0.1]),
         "loss_masks": lm,
-        "reference": torch.randint(0, 255, (1, nf, 3, h, w), dtype=torch.uint8),
     }
 
 
@@ -359,29 +348,25 @@ def test_render_reference_moves_the_cutout_and_keeps_frame_zero():
     assert not ((ref[4, :, :6, 0] > 200)).any()         # and its old place is filled with scene, not left red
 
 
-def test_reference_condition_trains_and_generates_on_the_tiny_model():
+def test_drag_start_and_composite_generate_on_the_tiny_model():
     import copy
     import torch
     from PIL import Image
     from src.ltx_wrapper import LTXBackbone
 
     c = copy.deepcopy(cfg)
-    c["adapter"].update(reference=True, cond_blocks=1, inject_every=1)
+    c["adapter"].update(cond_blocks=1, inject_every=1)
     bb = LTXBackbone(c, "cpu")
-    assert bb.motion.reference
     batch = _tiny_batch()
     torch.manual_seed(0)
-    loss = bb.training_loss(batch, generator=torch.Generator().manual_seed(0), use_condition=True, sigma=0.5)
-    assert torch.isfinite(loss)
-    assert "ref_proj" in bb.motion.trainable_state()
+    assert torch.isfinite(bb.training_loss(batch, generator=torch.Generator().manual_seed(0), use_condition=True, sigma=0.5))
 
-    torch.manual_seed(0)
     traj = np.stack([np.linspace(0.2, 0.6, NF), np.full(NF, 0.4)], 1).astype(np.float32)
     mask = np.zeros((H, W), bool)
     mask[20:36, 12:32] = True
     img = Image.fromarray(np.random.RandomState(0).randint(0, 255, (H, W, 3), dtype=np.uint8))
-    for ref_init in (0.0, 0.7):
-        frames = bb.generate(img, traj, steps=4, mask=mask, ref_init=ref_init)
+    for kw in ({}, {"ref_init": 0.7}, {"ref_init": 0.7, "bg_comp": 2.5}):
+        frames = bb.generate(img, traj, steps=4, mask=mask, **kw)
         assert frames.shape == (NF, H, W, 3)
 
 
@@ -447,12 +432,7 @@ def test_background_motion_separates_object_motion_from_background_motion():
     assert moving["bg_drift"] > 5 * still["bg_drift"] + 0.01 and moving["bg_flow"] > 3 * still["bg_flow"]
 
 
-def test_near_object_scale_and_bg_lock_run_on_the_tiny_model():
-    import copy
-    import torch
-    from PIL import Image
-    from src.ltx_wrapper import LTXBackbone
-
+def test_near_object_scale_widens_the_footprint():
     mc = MotionControl(num_blocks=4, hidden_dim=16, inject_every=4, local_inject=2.0)
     traj = torch.full((1, NF, 2), 0.1)
     vis = torch.ones(1, NF, dtype=torch.bool)
@@ -461,18 +441,6 @@ def test_near_object_scale_and_bg_lock_run_on_the_tiny_model():
     small = mc.near_object(traj, vis, shape, entity, scale=1.0)
     large = mc.near_object(traj, vis, shape, entity, scale=4.0)
     assert small.shape == (1, 3 * 8 * 12, 1) and large.sum() > small.sum()
-
-    c = copy.deepcopy(cfg)
-    c["adapter"].update(reference=True, cond_blocks=1, inject_every=1)
-    bb = LTXBackbone(c, "cpu")
-    torch.manual_seed(0)
-    img = Image.fromarray(np.random.RandomState(0).randint(0, 255, (H, W, 3), dtype=np.uint8))
-    path = np.stack([np.linspace(0.2, 0.6, NF), np.full(NF, 0.4)], 1).astype(np.float32)
-    mask = np.zeros((H, W), bool)
-    mask[20:36, 12:32] = True
-    plain = bb.generate(img, path, steps=3, mask=mask, use_motion=False)
-    locked = bb.generate(img, path, steps=3, mask=mask, bg_lock=2.5)
-    assert plain.shape == locked.shape == (NF, H, W, 3)
 
 
 def test_benchmark_helpers_for_clean_ood_images():
@@ -496,9 +464,8 @@ def test_benchmark_helpers_for_clean_ood_images():
 
 def test_benchmark_end_to_end_with_stubbed_heavy_models(tmp_path, monkeypatch):
     """Runs benchmark.main() on the tiny LTX with fake CLIP / CoTracker / SAM 2 (not available offline):
-    two seeds, a val clip and a clean out-of-domain image, ref_init and bg_lock on."""
+    two seeds, a val clip and a clean out-of-domain image, ref_init on."""
     import json
-    import types
     import imageio.v2 as imageio
     from PIL import Image
 
@@ -526,30 +493,22 @@ def test_benchmark_end_to_end_with_stubbed_heavy_models(tmp_path, monkeypatch):
             return {"clip_image_sim": 0.9, "first_frame_psnr": 30.0, "first_frame_ssim": 0.9, "color_drift": 0.01,
                     "clip_temporal": 0.95, "warp_error": 0.01, "sharpness_ratio": 1.0}
 
-    class Off:
-        ok = False
-        def __init__(self, device): pass
-
     class FakeTracker:
         ok = True
         def __init__(self, device): pass
         def track(self, frames, mask): return np.repeat(mask[None], len(frames), 0)
 
-    fake_eval = types.ModuleType("evaluate")
-    fake_eval.load_cotracker = lambda device: None
-    fake_eval.track_point = lambda ct, frames, start, device: np.stack(
+    monkeypatch.setattr(benchmark, "load_cotracker", lambda device: None)
+    monkeypatch.setattr(benchmark, "track_point", lambda ct, frames, start, device: np.stack(
         [np.linspace(start[0] / frames.shape[2], start[0] / frames.shape[2] + 0.1, len(frames)),
-         np.full(len(frames), start[1] / frames.shape[1])], 1)
-    monkeypatch.setitem(sys.modules, "evaluate", fake_eval)
+         np.full(len(frames), start[1] / frames.shape[1])], 1))
     monkeypatch.setattr(benchmark, "VideoQuality", FakeQuality)
-    monkeypatch.setattr(benchmark, "AestheticScorer", Off)
-    monkeypatch.setattr(benchmark, "VideoFeatures", Off)
     monkeypatch.setattr(benchmark, "Sam2Tracker", FakeTracker)
     monkeypatch.setattr(benchmark, "object_appearance", lambda *a, **k: {})
     out = tmp_path / "out"
     monkeypatch.setattr(sys, "argv", ["benchmark.py", "--tiny", "--data_root", str(tmp_path / "data"), "--num_images", "1",
                                       "--ood_dir", str(ood), "--motions", "left,right", "--seeds", "0,1", "--steps", "3",
-                                      "--ref_init", "0.7", "--bg_lock", "2.5", "--out", str(out)])
+                                      "--ref_init", "0.7", "--out", str(out)])
     benchmark.main()
 
     res = json.loads((out / "results.json").read_text())
@@ -569,7 +528,7 @@ def test_scene_composite_replaces_background_tokens_with_the_object_free_scene()
     from src.ltx_wrapper import LTXBackbone
 
     c = copy.deepcopy(cfg)
-    c["adapter"].update(reference=True, cond_blocks=1, inject_every=1)
+    c["adapter"].update(cond_blocks=1, inject_every=1)
     c["inference"]["bg_comp_release"] = 0.0           # never release: the composite stays on to the last step
     bb = LTXBackbone(c, "cpu")
     Fl, Hl, Wl = LATENT
@@ -593,44 +552,6 @@ def test_scene_composite_replaces_background_tokens_with_the_object_free_scene()
     lat = seen["lat"]
     assert torch.allclose(lat[:, :, 0], fixed_img[:, :, 0], atol=1e-5)         # the input image frame stays clean
     assert torch.allclose(lat[:, :, 1:], fixed_ref[:, :, 1:], atol=1e-5)       # everything else = the object-free scene
-
-
-def test_sde_style_training_samples_are_consistent_with_the_model_input():
-    """An oracle that knows the real clip must get loss 0 on SDEdit-style samples (input = noised drag video,
-    target = velocity towards the real clip, timestep = the clamped sigma), and the loss must differ from the standard one."""
-    import copy
-    import torch
-    from src.ltx_wrapper import LTXBackbone
-    from src.motion_control import pack_latents
-
-    c = copy.deepcopy(cfg)
-    c["adapter"].update(reference=True, cond_blocks=1, inject_every=1)
-    c["train"].update(sde_prob=1.0, sde_max=0.8, focus_loss=0.0)
-    bb = LTXBackbone(c, "cpu")
-    Fl, Hl, Wl = LATENT
-    g = torch.Generator().manual_seed(0)
-    real = torch.randn(1, 128, Fl, Hl, Wl, generator=g)
-    ref = torch.randn(1, 128, Fl, Hl, Wl, generator=g)
-    calls = iter([real, ref])
-    bb.encode_video = lambda v: next(calls)                      # 1st call: the real clip, 2nd: the drag video
-    x0 = pack_latents(real)
-    bb._predict = lambda tokens, sig, keep, coords, **k: (tokens - x0) / sig.unsqueeze(-1)    # oracle for the true target
-    batch = _tiny_batch()
-    loss = bb.training_loss(batch, generator=torch.Generator().manual_seed(1), sigma=0.9, focus=0.0)
-    assert float(loss) < 1e-8                                    # sigma 0.9 is clamped to 0.8 and fed to the model as 0.8
-
-    calls = iter([real, ref])
-    c["train"]["sde_prob"] = 0.0                                 # the standard sample: the same oracle is exact there too
-    plain = bb.training_loss(batch, generator=torch.Generator().manual_seed(1), sigma=0.9, focus=0.0)
-    assert float(plain) < 1e-8
-    bb._predict = lambda tokens, sig, keep, coords, **k: torch.zeros_like(tokens)    # a non-oracle: the targets differ per mode
-    c["train"]["sde_prob"] = 1.0
-    calls = iter([real, ref])
-    a = bb.training_loss(batch, generator=torch.Generator().manual_seed(1), sigma=0.9, focus=0.0)
-    c["train"]["sde_prob"] = 0.0
-    calls = iter([real, ref])
-    b = bb.training_loss(batch, generator=torch.Generator().manual_seed(1), sigma=0.9, focus=0.0)
-    assert not torch.isclose(a, b)
 
 
 def test_token_cap_has_no_hot_spot_and_adapter_scale_is_a_plain_dial():
@@ -691,23 +612,3 @@ def test_adapter_scale_and_min_sigma_gate_the_adapter_during_generation():
     assert torch.allclose(off, never, atol=1e-6) and torch.allclose(off, plain, atol=1e-6)   # off == no adapter at all
     assert not torch.allclose(full, off, atol=1e-4) and not torch.allclose(half, full, atol=1e-5)
     assert bb.motion.scale == 1.0          # the dial is restored after a call
-
-
-def test_sde_validation_mode_pins_the_noise_level_and_ignores_condition_dropout():
-    import copy
-    from src.ltx_wrapper import LTXBackbone
-
-    c = copy.deepcopy(cfg)
-    c["adapter"].update(reference=True, cond_blocks=1, inject_every=1)
-    c["train"].update(sde_prob=0.5, sde_min=0.35, sde_max=0.8, focus_loss=0.0)
-    bb = LTXBackbone(c, "cpu")
-    Fl, Hl, Wl = LATENT
-    g = torch.Generator().manual_seed(0)
-    real, ref = (torch.randn(1, 128, Fl, Hl, Wl, generator=g) for _ in range(2))
-    sigmas = []
-    bb._predict = lambda tokens, sig, keep, coords, **k: (sigmas.append(sig[0, -1].item()) or torch.zeros_like(tokens))
-    batch = _tiny_batch()
-    for sd, sg in ((True, 0.9), (True, 0.5), (True, 0.1), (False, 0.5)):
-        bb.encode_video = (lambda it: (lambda v: next(it)))(iter([real, ref]))
-        bb.training_loss(batch, generator=torch.Generator().manual_seed(1), use_condition=False, sigma=sg, focus=0.0, sde=sd)
-    assert sigmas == pytest.approx([0.8, 0.5, 0.35, 0.5])      # SDE samples: pinned and clamped into [sde_min, sde_max]
