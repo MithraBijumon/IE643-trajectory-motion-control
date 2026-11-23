@@ -22,3 +22,6 @@ results/tiny/
 results/app/
 
 ie643_colab.zip
+
+# archives built for Colab / Kaggle / Overleaf
+*.zip

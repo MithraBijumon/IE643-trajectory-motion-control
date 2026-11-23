@@ -21,7 +21,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, Subset
 
-from src.dataset import TrajectoryDataset
+from src.dataset import TrajectoryDataset, collect_prompts
 from src.ltx_wrapper import LTXBackbone
 from src.utils import apply_checkpoint_cfg, get_device, load_config, seed_everything
 
@@ -52,6 +52,8 @@ def make_loader(cfg, split, train, overfit=0, limit=None):
         augment=bool(d.get("augment", False)) and train and not overfit,
         mask_loss=bool(d.get("mask_loss", True)),
         reference=bool(cfg["adapter"].get("reference", False)),
+        captions=bool(d.get("captions", True)),
+        speed_aug=bool(d.get("speed_aug", True)),
     )
     if overfit:
         dataset.samples = most_moving(dataset, overfit)
@@ -85,7 +87,7 @@ def lr_factor(step, total, warmup, floor=0.1):
 
 
 @torch.no_grad()
-def validate(backbone, loader, device, seed=1234):
+def validate(backbone, loader, device, seed=1234, sde=None):
     """Val loss with the trajectory and without it, on identical noise, over a grid of noise levels.
 
     Motion is decided at high noise, and one random noise level per clip is too coarse to see a
@@ -94,6 +96,7 @@ def validate(backbone, loader, device, seed=1234):
         gain_by_sigma  : {sigma: loss_without - loss_with}
         gain_by_clip   : {clip name: loss_without - loss_with}   (one bad clip shows up here)
     cond_gain = without - with; clearly > 0 means the model uses the trajectory.
+    sde=True scores SDEdit-style samples instead (input = the noised drag video, as in --ref_init generation).
     """
     backbone.motion.eval()
 
@@ -107,7 +110,7 @@ def validate(backbone, loader, device, seed=1234):
             name = batch["name"][0]
             for sg in VAL_SIGMAS:
                 loss, pt = backbone.training_loss(
-                    batch, generator=gen, use_condition=use, sigma=sg, focus=0.0, return_parts=True
+                    batch, generator=gen, use_condition=use, sigma=sg, focus=0.0, return_parts=True, sde=sde
                 )
                 losses[use][(name, sg)] = loss.item()
                 for k in ("obj", "bg"):
@@ -145,6 +148,12 @@ def main():
     p.add_argument("--no_entity_embedding", action="store_true", help="entity condition without the per-object feature (footprint + flow only)")
     p.add_argument("--repeat", type=int, default=None, help="visits per clip per epoch (data.repeat)")
     p.add_argument("--focus_loss", type=float, default=None, help="extra training-loss weight around the controlled object: w = 1 + focus * footprint (0 = off)")
+    p.add_argument("--max_inject", type=float, default=None, help="cap on the injected residual relative to the hidden state's RMS (config: adapter.max_inject)")
+    p.add_argument("--inject_cap", choices=["global", "token"], default=None, help="cap per token (no hot spot) or on the global RMS (old)")
+    p.add_argument("--sde_prob", type=float, default=None, help="share of training samples built from the NOISED DRAG VIDEO (SDEdit-style, matches --ref_init at inference), e.g. 0.5")
+    p.add_argument("--no_reference", action="store_true", help="ablation: no drag-video condition (adapter.reference false)")
+    p.add_argument("--no_captions", action="store_true", help="ablation: the one config prompt for every clip (data.captions false)")
+    p.add_argument("--local_inject", type=float, default=None, help="ablation: 0 = inject everywhere, >0 = only near the object (x radius)")
     p.add_argument("--no_grad_ckpt", action="store_true", help="turn gradient checkpointing off: ~30%% faster, needs an 80 GB card")
     p.add_argument("--eval_only", action="store_true", help="with --resume: print cond_gain on val clips and on train clips, then exit")
     p.add_argument("--overfit", type=int, default=0, metavar="K", help="sanity check: train and validate on the K most-moving clips only, fixed crop, no augmentation/dropout")
@@ -169,6 +178,18 @@ def main():
         cfg["adapter"]["relative"] = True
     if args.epochs:
         cfg["train"]["epochs"] = args.epochs
+    if args.max_inject is not None:
+        cfg["adapter"]["max_inject"] = args.max_inject
+    if args.inject_cap is not None:
+        cfg["adapter"]["inject_cap"] = args.inject_cap
+    if args.sde_prob is not None:
+        cfg["train"]["sde_prob"] = args.sde_prob
+    if args.no_reference:
+        cfg["adapter"]["reference"] = False
+    if args.no_captions:
+        cfg["data"]["captions"] = False
+    if args.local_inject is not None:
+        cfg["adapter"]["local_inject"] = args.local_inject
     if args.no_grad_ckpt:
         cfg["model"]["gradient_checkpointing"] = False
     if args.overfit:
@@ -199,7 +220,9 @@ def main():
     print(f"Device: {device} | tiny: {cfg['is_tiny']} | adapter: multilayer / entity"
           f" | relative: {cfg['adapter'].get('relative', False)} | augment: {cfg['data'].get('augment', False)} | embedding: {cfg['adapter'].get('entity_embedding', True)} | lr {cfg['train']['lr']} accum {cfg['train']['grad_accum']}")
     print("Loading LTX...")
-    backbone = LTXBackbone(cfg, device)
+    prompts = collect_prompts(cfg["data"]["root"]) if cfg["data"].get("captions", True) else []
+    print(f"{len(prompts)} clip captions")
+    backbone = LTXBackbone(cfg, device, prompts=prompts)
 
     train_set, train_loader = make_loader(cfg, "train", train=True, overfit=args.overfit)
     val_set, val_loader = make_loader(cfg, "val", train=False, overfit=args.overfit)
@@ -227,6 +250,8 @@ def main():
         sum(q.numel() for q in motion.parameters() if q.requires_grad),
     )
 
+    sde_val = t.get("sde_prob", 0.0) > 0 and motion.reference     # SDE-style validation + selection (the regime of --ref_init)
+    best_on = "val_sde_obj_loss" if sde_val else "val_obj_loss"
     start_epoch, best_val = 0, float("inf")
     if args.resume:
         ckpt = backbone.load_checkpoint(args.resume)
@@ -234,7 +259,8 @@ def main():
         # load_state_dict restores the old lrs; re-apply the ones from the config
         optimizer.param_groups[0]["lr"] = t["lr"]
         start_epoch = ckpt["epoch"]
-        best_val = ckpt.get("best_val", best_val)
+        if ckpt.get("best_on") == best_on:   # checkpoints that selected on another loss are not comparable
+            best_val = ckpt.get("best_val", best_val)
         print(f"Resumed from {args.resume} at epoch {start_epoch}")
 
     if args.eval_only:
@@ -308,9 +334,13 @@ def main():
         if len(val_set):
             v = validate(backbone, val_loader, device)
             val_loss, val_loss_nocond = v["with"], v["without"]
+            vs = None
+            if sde_val:   # the same measurement in the regime --ref_init generation runs in
+                vs = validate(backbone, val_loader, device, sde=True)
         else:
             v = {"gain_by_sigma": {}, "gain_by_clip": {}, "obj_with": float("nan"), "obj_without": float("nan"),
                  "bg_with": float("nan"), "bg_without": float("nan")}
+            vs = None
             val_loss = val_loss_nocond = float("nan")
 
         train_gain = None
@@ -330,6 +360,9 @@ def main():
             "val_obj_loss": v["obj_with"], "val_bg_loss": v["bg_with"],
             "gain_by_sigma": {str(k): round(x, 5) for k, x in v["gain_by_sigma"].items()},
             "gain_by_clip": {k: round(x, 5) for k, x in v["gain_by_clip"].items()},
+            **({"val_sde_obj_gain": vs["obj_without"] - vs["obj_with"], "val_sde_obj_loss": vs["obj_with"],
+                "val_sde_gain": vs["without"] - vs["with"], "val_sde_bg_gain": vs["bg_without"] - vs["bg_with"],
+                "sde_gain_by_sigma": {str(k): round(x, 5) for k, x in vs["gain_by_sigma"].items()}} if vs else {}),
             "adapter_scale": motion.gate_value(),
             "inject_ratio": inject_ratio,
             "grad_norm_mean": round(sum(norms) / max(len(norms), 1), 4),
@@ -341,14 +374,18 @@ def main():
         with open(log_path, "a") as f:
             f.write(json.dumps(record) + "\n")
 
-        is_best = len(val_set) > 0 and val_loss < best_val
+        # best.pt = lowest loss on the object's tokens (val_obj_loss); the overall val_loss is dominated by background tokens
+        # (with --sde_prob the model is used from the noised drag video, so that is the loss to select on)
+        score = vs["obj_with"] if vs else v["obj_with"]
+        is_best = len(val_set) > 0 and score < best_val
         if is_best:
-            best_val = val_loss
+            best_val = score
 
         extra = {
             "epoch": epoch + 1,
             "optimizer": optimizer.state_dict(),
             "best_val": best_val,
+            "best_on": best_on,
             "train_loss": train_loss,
             "val_loss": val_loss,
         }

@@ -170,7 +170,8 @@ def get_tracker():
     return _state["sam2"]
 
 
-def generate(image_path, points, mask_native, preset, length, steps, seed, motion_guidance, progress=gr.Progress()):
+def generate(image_path, points, mask_native, preset, length, steps, seed, motion_guidance, adapter_scale=1.0,
+             progress=gr.Progress()):
     if image_path is None:
         raise gr.Error("Upload an image first.")
     if preset == PRESETS[0] and len(points) < 2:
@@ -212,6 +213,7 @@ def generate(image_path, points, mask_native, preset, length, steps, seed, motio
         decode_timestep=cfg["inference"]["decode_timestep"],
         seed=int(seed),
         motion_guidance=float(motion_guidance),
+        adapter_scale=float(adapter_scale),
         progress=lambda f: progress(f, desc="Denoising"),
     )
 
@@ -269,6 +271,8 @@ def build_demo():
                 preset = gr.Radio(PRESETS, value=PRESETS[0], label="Motion")
                 length = gr.Slider(0.1, 0.6, value=0.3, step=0.05, label="Preset path length (fraction of the frame)")
                 guidance = gr.Slider(1.0, 4.0, value=1.0, step=0.5, label="Motion strength (guidance)")
+                adapter_scale = gr.Slider(0.0, 8.0, value=3.0, step=0.5,
+                                          label="Adapter strength (x trained; 0 = plain LTX-Video, 3 = benchmark setting, above 6 may add artifacts)")
                 steps = gr.Slider(2, 50, value=30, step=1, label="Denoising steps")
                 seed = gr.Number(value=0, label="Seed", precision=0)
                 run = gr.Button("Generate video", variant="primary")
@@ -285,7 +289,7 @@ def build_demo():
         preview.select(on_click, [upload, mode] + states, states + [preview])
         clear_path.click(on_clear_path, [upload, box, pos, neg, mask], [points, preview])
         clear_obj.click(on_clear_object, [upload, points], [box, pos, neg, mask, preview])
-        run.click(generate, [upload, points, mask, preset, length, steps, seed, guidance],
+        run.click(generate, [upload, points, mask, preset, length, steps, seed, guidance, adapter_scale],
                   [video, overlay, tracked, report, mask_img])
     return demo
 

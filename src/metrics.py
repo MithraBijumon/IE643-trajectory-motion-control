@@ -134,6 +134,34 @@ def warp_error(frames):
     return float(np.mean(errs))
 
 
+def background_motion(frames, masks, scale=0.5, margin=0.08):
+    """Unintended background movement: how much the scene OUTSIDE the object changes.
+
+    frames: (T, H, W, 3) uint8; masks: (T, H, W) bool, the object in every frame.
+    bg_drift: mean |frame_t - frame_0| over pixels that are background in both frames, 0-1. A static scene stays near 0.
+    bg_flow:  mean optical-flow magnitude between neighbouring frames over background pixels, as a fraction of the
+              frame width per frame. Camera motion counts too, so compare adapter vs. plain LTX on the same image.
+    The object is grown by `margin` x the frame width first, so the flow the moving object induces around itself is ignored.
+    """
+    T, H, W = frames.shape[:3]
+    h, w = max(int(H * scale), 16), max(int(W * scale), 16)
+    gray = [cv2.cvtColor(cv2.resize(f, (w, h), interpolation=cv2.INTER_AREA), cv2.COLOR_RGB2GRAY) for f in frames]
+    r = max(int(margin * w), 2)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * r + 1, 2 * r + 1))
+    obj = [cv2.dilate(cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST), kernel) > 0 for m in masks]
+    drift, flow = [], []
+    for t in range(1, T):
+        keep = ~(obj[0] | obj[t])
+        if keep.mean() > 0.05:
+            drift.append(np.abs(gray[t].astype(np.float32) - gray[0].astype(np.float32))[keep].mean() / 255.0)
+        keep = ~(obj[t - 1] | obj[t])
+        if keep.mean() > 0.05:
+            f = cv2.calcOpticalFlowFarneback(gray[t - 1], gray[t], None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            flow.append(np.linalg.norm(f, axis=-1)[keep].mean() / w)
+    return {"bg_drift": float(np.mean(drift)) if drift else float("nan"),
+            "bg_flow": float(np.mean(flow)) if flow else float("nan")}
+
+
 def sharpness(frames):
     """Mean variance of the Laplacian (no-reference; blur / diffusion mush -> low)."""
     return float(np.mean([cv2.Laplacian(cv2.cvtColor(f, cv2.COLOR_RGB2GRAY), cv2.CV_64F).var() for f in frames]))

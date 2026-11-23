@@ -45,7 +45,7 @@ class MotionControl(nn.Module):
     """
 
     def __init__(self, dim=128, num_blocks=0, hidden_dim=0, inject_every=4, relative=False, max_inject=0.0,
-                 cond_blocks=0, cond_heads=4, local_inject=0.0, reference=False):
+                 cond_blocks=0, cond_heads=4, local_inject=0.0, reference=False, cap="global"):
         super().__init__()
         # >0: inject only around the object: the residual is multiplied by a Gaussian footprint whose radius is
         # local_inject x the object's radius (the background stays exactly as LTX would produce it). 0 = everywhere
@@ -55,8 +55,15 @@ class MotionControl(nn.Module):
         self.reference = reference
         if reference:
             self.ref_proj = nn.Conv3d(dim, 128, 1)
+            nn.init.zeros_(self.ref_proj.weight)   # the drag video joins the condition gradually (ControlNet-style zero init)
+            nn.init.zeros_(self.ref_proj.bias)
         self.relative = relative  # inject in units of the hidden state's own RMS (absolute injection is easily drowned out)
         self.max_inject = max_inject  # never inject more than this fraction of the hidden RMS (0 = no cap)
+        # cap = "global": the cap bounds the RMS over ALL tokens. With local_inject most tokens get 0, so inside the footprint a token
+        #                 can receive many times max_inject (a 4% footprint at cap 0.05 -> ~25% per token, at every injection point).
+        # cap = "token":  the cap bounds every token's own residual: no hot spot, whatever the object's size.
+        self.cap = cap
+        self.scale = 1.0   # inference dial for the adapter's strength (1 = as trained, 0 = off); not trained
         self.condition_encoder = EntityConditionEncoder(in_channels=3 + dim)
         # small randomly initialised transformer blocks: the condition tokens see each other before injection
         self.cond_blocks = nn.ModuleList([
@@ -96,10 +103,12 @@ class MotionControl(nn.Module):
                 tokens = blk(tokens)
         return tokens
 
-    def near_object(self, trajectory, visible, latent_shape, entity):
-        """(B, S, 1) in [0, 1]: how close each latent token is to the object (widened by local_inject)."""
+    def near_object(self, trajectory, visible, latent_shape, entity, scale=None):
+        """(B, S, 1) in [0, 1]: how close each latent token is to the object (radius widened by `scale`,
+        default local_inject)."""
         Fl, Hl, Wl = latent_shape
-        fp = entity_footprint(trajectory, visible, entity["radius"] * self.local_inject, Hl, Wl)  # (B, F, Hl, Wl)
+        scale = self.local_inject if scale is None else scale
+        fp = entity_footprint(trajectory, visible, entity["radius"] * scale, Hl, Wl)  # (B, F, Hl, Wl)
         idx = torch.linspace(0, fp.shape[1] - 1, Fl).round().long().to(fp.device)  # latent frame k shows video frame ~8k
         return fp[:, idx].reshape(fp.shape[0], -1, 1)
 
@@ -134,12 +143,20 @@ class MotionControl(nn.Module):
                     if self.max_inject > 0:
                         # safety brake: a high-lr Adam step can multiply the injection in a few updates and
                         # wreck LTX's activations; this bounds the damage per forward pass
-                        rms_r = r.detach().float().pow(2).mean(dim=(1, 2), keepdim=True).sqrt()
+                        if self.cap == "token":
+                            rms_r = r.detach().float().pow(2).mean(dim=2, keepdim=True).sqrt()      # (B, S, 1): each token on its own
+                        else:
+                            rms_r = r.detach().float().pow(2).mean(dim=(1, 2), keepdim=True).sqrt()
                         r = r * (self.max_inject * rms_h / rms_r.clamp(min=1e-8)).clamp(max=1.0).to(r.dtype)
+                if self.scale != 1.0:
+                    r = r * self.scale
                 with torch.no_grad():
-                    num = r.float().pow(2).mean().sqrt()
-                    den = output.float().pow(2).mean().sqrt().clamp(min=1e-6)
-                    if float(num) > 0:  # skip condition-dropout forwards, which inject exactly 0
+                    # strength where the adapter actually acts: RMS over the tokens that receive a residual / the hidden RMS
+                    act = (r.detach().float().abs().sum(dim=-1) > 0)
+                    n_act = int(act.sum())
+                    if n_act > 0:  # skip condition-dropout forwards, which inject exactly 0
+                        num = (r.detach().float().pow(2).sum() / (n_act * r.shape[-1])).sqrt()
+                        den = output.detach().float().pow(2).mean().sqrt().clamp(min=1e-6)
                         self._ratio[i] = num / den
                 return output + r
             return hook

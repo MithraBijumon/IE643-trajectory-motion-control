@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 from PIL import Image
 
+from src.dataset import read_caption
 from src.ltx_wrapper import LTXBackbone
 from src.utils import (
     apply_checkpoint_cfg,
@@ -65,7 +66,7 @@ def load_sample(args, cfg):
 
 
 def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=None, guidance=None,
-        motion_guidance=None, use_motion=True, mask=None):
+        motion_guidance=None, use_motion=True, mask=None, prompt=None):
     inf = cfg["inference"]
     frames = backbone.generate(
         image,
@@ -78,6 +79,7 @@ def run(backbone, cfg, image, trajectory, visible, out_path, seed=None, steps=No
         motion_guidance=inf["motion_guidance"] if motion_guidance is None else motion_guidance,
         use_motion=use_motion,
         mask=mask,
+        prompt=prompt,
     )
 
     save_video(frames, out_path, fps=inf["fps"])
@@ -100,6 +102,11 @@ def main():
     p.add_argument("--guidance", type=float, default=None)
     p.add_argument("--seed", type=int, default=None)
     p.add_argument("--motion_guidance", type=float, default=None, help=">1 amplifies the trajectory")
+    p.add_argument("--bg_lock", type=float, default=None, help="lock the background outside this many object radii (e.g. 2.5)")
+    p.add_argument("--adapter_scale", type=float, default=None, help="strength of the adapter residual at inference (1 = as trained, 0 = off; the drag video / composite still run)")
+    p.add_argument("--adapter_min_sigma", type=float, default=None, help="the adapter acts only while sigma >= this (e.g. 0.4); plain LTX finishes the detail")
+    p.add_argument("--bg_comp", type=float, default=None, help="composite the object-free scene outside this many object radii (e.g. 2.5)")
+    p.add_argument("--prompt", default=None, help="text prompt for this image (default: <sample_dir>/caption.txt, else the config prompt)")
     p.add_argument("--ref_init", type=float, default=None, help="start from the drag video noised to this sigma (e.g. 0.8)")
     p.add_argument("--no_motion", action="store_true", help="run plain LTX image-to-video (baseline)")
     args = p.parse_args()
@@ -110,7 +117,16 @@ def main():
     cfg = apply_checkpoint_cfg(load_config(args.config, tiny=args.tiny), args.checkpoint)
     if args.ref_init is not None:
         cfg["inference"]["ref_init"] = args.ref_init
-    backbone = LTXBackbone(cfg, get_device())
+    if args.bg_lock is not None:
+        cfg["inference"]["bg_lock"] = args.bg_lock
+    if args.bg_comp is not None:
+        cfg["inference"]["bg_comp"] = args.bg_comp
+    if args.adapter_scale is not None:
+        cfg["inference"]["adapter_scale"] = args.adapter_scale
+    if args.adapter_min_sigma is not None:
+        cfg["inference"]["adapter_min_sigma"] = args.adapter_min_sigma
+    prompt = args.prompt or (read_caption(args.sample_dir) if args.sample_dir else "") or None
+    backbone = LTXBackbone(cfg, get_device(), prompts=[prompt] if prompt else None)
 
     if args.checkpoint:
         backbone.load_checkpoint(args.checkpoint)
@@ -118,7 +134,7 @@ def main():
 
     image, trajectory, visible, mask = load_sample(args, cfg)
     run(backbone, cfg, image, trajectory, visible, args.out, args.seed, args.steps, args.guidance,
-        args.motion_guidance, use_motion=not args.no_motion, mask=mask)
+        args.motion_guidance, use_motion=not args.no_motion, mask=mask, prompt=prompt)
     print(f"Saved {args.out}")
 
 

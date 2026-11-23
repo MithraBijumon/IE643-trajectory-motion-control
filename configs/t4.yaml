@@ -20,7 +20,8 @@ adapter:
   entity_embedding: true         # entity condition: also paint the object's own latent feature (set false if the model memorises scenes)
   mask_shape: true               # entity condition: paint the object's real SAM silhouette (translated along the path) instead of a round blob
   embedding_dropout: 0.3         # entity condition: hide the object feature in this fraction of training steps (fights memorising scenes)
-  max_inject: 0.05               # multilayer+relative: hard cap on |injection| / |hidden state| per block (safety brake; raise once training is stable)
+  max_inject: 0.1                # multilayer+relative: hard cap on |injection| / |hidden state| (safety brake)
+  inject_cap: token              # cap EACH token's residual (no hot spot). 'global' (old): cap on the RMS over all tokens - with local_inject a small object then got ~5x that per token
 
 data:
   root: data/dataset_got10k
@@ -30,6 +31,7 @@ data:
   width: 512                     # must be a multiple of 32
   rope_fps: 24                   # frame rate for the rotary time coordinates. GOT-10k is ~10 fps: try 10 as an experiment (changes how fast LTX expects motion to be)
   num_workers: 4                 # video decoding in background workers (set 0 if the machine has <4 CPU cores)
+  captions: true                 # use each clip's own text prompt (<clip>/caption.txt from scripts/caption_clips.py) instead of the one config prompt
   mask_loss: true                # SAM 2 per-frame masks weight the training loss on the object (focus_loss). false = Gaussian footprint along the path instead (ablation)
   augment: true                  # train only: a random tracked point (tracks.npy) per visit + random mirror flip; fights overfitting on few scenes
   repeat: 2                      # train only: visits per clip per epoch (each visit = new random crop/track/flip). Updates per epoch = clips * repeat / grad_accum
@@ -53,10 +55,18 @@ train:
   time_ramp: 1.0                 # object-token weight grows linearly over time, (1 + time_ramp) x in the last latent frame (0 = flat)
   sigma_mean: 0.5                # >0 samples noisier timesteps more often (logit-normal mean); the motion is decided at high noise. 0 = LTX default
   cond_dropout: 0.1             # fraction of samples trained without the trajectory (enables motion_guidance)
+  sde_prob: 0.0                  # >0 (e.g. 0.5): this share of samples starts from the noised drag video and learns to repaint it into the real clip (matches --ref_init at inference)
+  sde_min: 0.35                  # ... noised to a level drawn uniformly from [sde_min, sde_max]
+  sde_max: 0.8                   # ... noised to at most this sigma
   max_val_samples: 16            # val clips used for the per-epoch val loss
 
 inference:
   steps: 40
+  bg_lock: 0.0                   # >0 (e.g. 2.5): outside this many object radii the velocity is plain LTX's (locks the background, +1 forward pass per step)
+  bg_comp: 0.0                   # >0 (e.g. 2.5): with the drag video, outside this many object radii the tokens are the object-free scene (removes the original object's ghost); released below sigma bg_comp_release
+  bg_comp_release: 0.25
+  adapter_scale: 1.0             # strength of the adapter residual (1 = as trained, 0 = off). Lower it if the output shows mosaic noise
+  adapter_min_sigma: 0.0         # the adapter acts only while sigma >= this (0 = always); e.g. 0.4 = plain LTX finishes the fine detail
   ref_init: 0.0                  # >0 (e.g. 0.8): start denoising from the drag video noised to this sigma (training-free boost; benchmark/inference --ref_init)
   guidance_scale: 3.0            # >1 enables classifier-free guidance on the text prompt
   decode_timestep: 0.05

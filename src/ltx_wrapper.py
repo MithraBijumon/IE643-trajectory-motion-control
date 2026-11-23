@@ -35,15 +35,20 @@ class LTXBackbone:
     exactly like LTXConditionPipeline's image-to-video mode.
     """
 
-    def __init__(self, cfg, device):
+    def __init__(self, cfg, device, prompts=None, keep_text_encoder=False):
+        """prompts: clip captions to encode once at start (the text encoder is dropped afterwards unless
+        keep_text_encoder, which allows add_prompts() later, e.g. in the app)."""
         self.cfg = cfg
         self.device = torch.device(device)
         self.dtype = torch_dtype(cfg["model"]["dtype"])
 
+        self.prompt_cache = {}  # text -> (embedding (L, D), mask (L,)) on the cpu
+        self._enc_gen = None    # seeded generator for VAE posterior sampling during generate(); None = global RNG (training)
+        self._t5_pipe = None
         if cfg["is_tiny"]:
             self._build_tiny()
         else:
-            self._build_pretrained()
+            self._build_pretrained(prompts or [], keep_text_encoder)
 
         self.vae.requires_grad_(False).eval()
         self.transformer.requires_grad_(False).eval()
@@ -66,6 +71,7 @@ class LTXBackbone:
             cond_heads=a.get("cond_heads", 4),
             local_inject=a.get("local_inject", 0.0),
             reference=a.get("reference", False),
+            cap=a.get("inject_cap", "global"),     # old checkpoints/configs have no key: they keep the old global cap
         ).to(self.device)
         self.motion.attach(self.transformer)
 
@@ -75,7 +81,7 @@ class LTXBackbone:
     # Construction
     # ------------------------------------------------------------------
 
-    def _build_pretrained(self):
+    def _build_pretrained(self, prompts, keep_text_encoder):
         from diffusers import LTXConditionPipeline
 
         m = self.cfg["model"]
@@ -93,13 +99,32 @@ class LTXBackbone:
         self.prompt = (pos, pos_mask)
         self.negative_prompt = (neg, neg_mask)
 
-        pipe.text_encoder.to("cpu")
-        del pipe.text_encoder
+        self._t5_pipe = pipe
+        self.add_prompts(prompts)
+        if not keep_text_encoder:
+            del pipe.text_encoder
+            self._t5_pipe = None
         if self.device.type == "cuda":
             torch.cuda.empty_cache()
 
         self.vae = pipe.vae.to(self.device)
         self.transformer = pipe.transformer.to(self.device)
+
+    def add_prompts(self, texts):
+        """Encode texts that are not cached yet (needs the text encoder: prompts= at construction or keep_text_encoder)."""
+        texts = sorted({t for t in texts if t and t not in self.prompt_cache})
+        if not texts or self.cfg["is_tiny"]:   # the tiny test model has no text encoder: it keeps the single config prompt
+            return
+        if self._t5_pipe is None:
+            raise RuntimeError("prompt not encoded: build the backbone with prompts=[...] or keep_text_encoder=True")
+        enc = self._t5_pipe.text_encoder.to(self.device)
+        with torch.no_grad():
+            for i in range(0, len(texts), 16):
+                chunk = texts[i:i + 16]
+                emb, mask, _, _ = self._t5_pipe.encode_prompt(chunk, None, do_classifier_free_guidance=False, device=self.device)
+                for t, e, m in zip(chunk, emb, mask):
+                    self.prompt_cache[t] = (e.cpu(), m.cpu())
+        enc.to("cpu")
 
     def _build_tiny(self):
         from diffusers import AutoencoderKLLTXVideo, LTXVideoTransformer3DModel
@@ -145,7 +170,9 @@ class LTXBackbone:
     @torch.no_grad()
     def encode_video(self, video):
         """(B, 3, F, H, W) in [-1, 1] -> normalized fp32 latents (B, 128, F', H', W')."""
-        z = self.vae.encode(video.to(self.device, self.dtype)).latent_dist.sample()
+        # sampling the VAE posterior is what training and LTX's own pipeline do; at generation time it is seeded (self._enc_gen), so the same
+        # seed gives the same conditioning latents in every variant: seed-matched comparisons really are matched
+        z = self.vae.encode(video.to(self.device, self.dtype)).latent_dist.sample(generator=self._enc_gen)
         return self.normalize(z.float())
 
     @torch.no_grad()
@@ -215,14 +242,23 @@ class LTXBackbone:
         mask[:, 0] = True
         return mask.reshape(batch, -1)
 
-    def _text(self, batch, negative=False):
+    def _text(self, batch, negative=False, captions=None):
+        """Text conditioning for `batch` samples: each clip's own caption if it was encoded, else the config prompt."""
+        if captions is not None and not negative:
+            es, ms = [], []
+            for c in captions:
+                hit = self.prompt_cache.get(c) if c else None
+                e, m = hit if hit else (self.prompt[0][0], self.prompt[1][0])
+                es.append(e.to(self.device))
+                ms.append(m.to(self.device))
+            return torch.stack(es).to(self.dtype), torch.stack(ms)
         emb, mask = self.negative_prompt if negative else self.prompt
         return emb.expand(batch, -1, -1), mask.expand(batch, -1)
 
-    def _predict(self, tokens, sigma_tokens, keep, coords, negative=False):
+    def _predict(self, tokens, sigma_tokens, keep, coords, negative=False, captions=None):
         """One transformer call. sigma_tokens: (B, S) in [0, 1]."""
         B = tokens.shape[0]
-        emb, mask = self._text(B, negative)
+        emb, mask = self._text(B, negative, captions)
 
         # conditioned (image) tokens always see timestep 0
         timestep = (sigma_tokens * 1000.0).masked_fill(keep, 0.0)
@@ -241,13 +277,16 @@ class LTXBackbone:
     # Training
     # ------------------------------------------------------------------
 
-    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None, return_parts=False):
+    def training_loss(self, batch, generator=None, use_condition=None, sigma=None, focus=None, return_parts=False, sde=None):
         """use_condition: None = normal (with condition dropout), True/False = force the
         trajectory on/off for every sample (used to measure what the trajectory is worth).
         focus: extra loss weight on the tokens around the controlled object, w = 1 + focus * footprint
         (None = train.focus_loss from the config, 0 = plain mean). Validation passes 0 so that
         cond_gain stays comparable between runs.
-        return_parts: also return {"obj": ..., "bg": ...}, the plain mean error inside / outside the object mask."""
+        return_parts: also return {"obj": ..., "bg": ...}, the plain mean error inside / outside the object mask.
+        sde: None = SDEdit-style samples at random with probability train.sde_prob (training only); True = ALL samples start from the
+             noised drag video (with `sigma` pinned: clamped into [sde_min, sde_max]) - the validation that matches --ref_init
+             generation; False = never."""
         video = batch["video"].permute(0, 2, 1, 3, 4)  # B,F,3,H,W -> B,3,F,H,W
         trajectory = batch["trajectory"].to(self.device)
         visible = batch["visible"].to(self.device)
@@ -264,6 +303,7 @@ class LTXBackbone:
         mean = self.cfg["train"].get("sigma_mean", 0.0)
         drawn = torch.sigmoid(torch.randn(B, 1, generator=generator, device=self.device) + mean)
         # `sigma` (a float in (0, 1)) pins the noise level, e.g. for a validation grid
+        sigma_pinned = sigma is not None
         sigma = drawn if sigma is None else torch.full_like(drawn, float(sigma))
         keep = self.first_frame_mask(B, latent_shape, self.device)
 
@@ -285,6 +325,27 @@ class LTXBackbone:
         if self.motion.reference:
             entity["ref_latent"] = self.encode_video(batch["reference"].to(self.device).permute(0, 2, 1, 3, 4).float() / 127.5 - 1)
 
+        target = noise - x0_tokens
+        sigma_in = sigma
+        sde_p = 1.0 if sde is True else (0.0 if sde is False else self.cfg["train"].get("sde_prob", 0.0))
+        if sde_p > 0 and (use_condition is None or sde is True) and self.motion.reference:
+            # SDEdit-style samples, the situation of --ref_init at inference: the input is the NOISED DRAG VIDEO (pasted object,
+            # filled hole) and the target is the velocity that leads from it to the real clip. The adapter then learns to repaint
+            # the drag video into a real video instead of only seeing noised real footage.
+            sde_rows = torch.rand(B, 1, 1, generator=generator, device=self.device) < sde_p
+            lo, hi = self.cfg["train"].get("sde_min", 0.35), self.cfg["train"].get("sde_max", 0.8)
+            # SDE samples get their own noise level in [lo, hi] (where --ref_init starts and early steps run): at small sigma the
+            # drag video differs a lot from the real clip and the target (x_sigma - x0)/sigma explodes; there normal samples train.
+            s = (lo + (hi - lo) * torch.rand(B, 1, 1, generator=generator, device=self.device))   # (B, 1, 1)
+            if sigma_pinned:                                                                        # validation grid: a fixed level
+                s = torch.full_like(s, min(max(float(sigma[0, 0]), lo), hi))
+            from_ref = (1 - s) * pack_latents(entity["ref_latent"]) + s * noise
+            from_ref = torch.where(keep.unsqueeze(-1), x0_tokens, from_ref)
+            to_real = (from_ref - x0_tokens) / s                                                    # x0 = x_sigma - sigma * velocity
+            noisy = torch.where(sde_rows, from_ref, noisy)
+            target = torch.where(sde_rows, to_real, target)
+            sigma_in = torch.where(sde_rows.squeeze(-1), s.squeeze(-1), sigma)
+
         res = self.motion.residuals(
             trajectory, visible, latent_shape, keep_mask=keep, cond_mask=cond_mask, entity=entity
         )
@@ -294,12 +355,12 @@ class LTXBackbone:
 
         pred = self._predict(
             noisy,
-            sigma.expand(-1, noisy.shape[1]),
+            sigma_in.expand(-1, noisy.shape[1]),
             keep,
             self.video_coords(B, latent_shape),
+            captions=batch.get("caption"),
         )
 
-        target = noise - x0_tokens
         err = ((pred - target) ** 2).mean(dim=-1)  # (B, S)
 
         t = self.cfg["train"]
@@ -374,6 +435,11 @@ class LTXBackbone:
         use_motion=True,
         mask=None,
         ref_init=None,
+        prompt=None,
+        bg_lock=None,
+        bg_comp=None,
+        adapter_scale=None,
+        adapter_min_sigma=None,
     ):
         """
         image:      PIL image, already sized (width, height) = cfg data size
@@ -382,6 +448,16 @@ class LTXBackbone:
         use_motion: False runs plain LTX image-to-video (the baseline)
         mask: (H, W) bool mask of the controlled object in `image`;
               a disk around the first trajectory point is used when it is missing
+        bg_lock: >0 locks the background: outside a footprint of this many object radii the velocity is exactly that of
+                 plain LTX (one extra forward pass per step), so only the object's surroundings can change. None = inference.bg_lock
+        bg_comp: >0 composites the scene: outside a footprint of this many object radii (along the path) the tokens are replaced at
+                 every step (until sigma drops below inference.bg_comp_release) by the drag video's object-free scene, so the
+                 original object cannot linger at its old place. Needs/uses the drag video. None = inference.bg_comp
+        adapter_scale: strength of the adapter's residual (1 = as trained, 0 = off but the drag video / composite still run, which
+                       is the training-free path with the same checkpoint loaded). None = inference.adapter_scale (1)
+        adapter_min_sigma: the adapter acts only while sigma >= this; below it plain LTX finishes the fine detail (motion is decided at
+                           high noise). 0 = always on. None = inference.adapter_min_sigma
+        prompt: text prompt for this image (encoded on first use); None = the config prompt
         ref_init: start the denoising from the drag video (src/reference.py) noised to this sigma (0 = from pure noise;
                   None = inference.ref_init). Only with use_motion; the baseline never sees it.
         Returns uint8 frames (F, H, W, 3).
@@ -397,6 +473,10 @@ class LTXBackbone:
             visible = np.ones(nF, dtype=bool)
 
         gen = torch.Generator(device=self.device).manual_seed(seed)
+        self._enc_gen = torch.Generator(device=self.device).manual_seed(seed + 7919)   # separate stream: the denoising noise is unchanged
+        if prompt:
+            self.add_prompts([prompt])
+        captions = [prompt] if prompt else None
 
         img = torch.from_numpy(np.array(image)).float().div(127.5).sub(1)
         img = img.permute(2, 0, 1)[None, :, None]  # 1,3,1,H,W
@@ -421,25 +501,39 @@ class LTXBackbone:
 
         if ref_init is None:
             ref_init = self.cfg["inference"].get("ref_init", 0.0)
+        if bg_comp is None:
+            bg_comp = self.cfg["inference"].get("bg_comp", 0.0)
         ref_tokens = None
-        if use_motion and (self.motion.reference or ref_init > 0):
+        if use_motion and (self.motion.reference or ref_init > 0 or bg_comp > 0):
             drag = render_reference(np.array(image), mask, np.asarray(trajectory), np.asarray(visible))
             drag = torch.from_numpy(drag).float().div(127.5).sub(1).permute(3, 0, 1, 2)[None]  # 1,3,F,H,W
             ref_latent = self.encode_video(drag)
             entity["ref_latent"] = ref_latent
             ref_tokens = pack_latents(ref_latent)
 
-        res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep, entity=entity)
+        res = self.motion.residuals(traj, vis, latent_shape, keep_mask=keep, entity=entity) if use_motion else None
+
+        if bg_lock is None:
+            bg_lock = self.cfg["inference"].get("bg_lock", 0.0)
+        near = self.motion.near_object(traj, vis, latent_shape, entity, scale=bg_lock) if (use_motion and bg_lock > 0) else None
+        comp_near = self.motion.near_object(traj, vis, latent_shape, entity, scale=bg_comp) if (use_motion and bg_comp > 0) else None
+        release = self.cfg["inference"].get("bg_comp_release", 0.25)
+        if adapter_scale is None:
+            adapter_scale = self.cfg["inference"].get("adapter_scale", 1.0)
+        if adapter_min_sigma is None:
+            adapter_min_sigma = self.cfg["inference"].get("adapter_min_sigma", 0.0)
+        self.motion.scale = float(adapter_scale)
 
         def velocity(x, sig, motion_on):
             self.motion.set_context(res if motion_on else None)
-            pred = self._predict(x, sig, keep, coords)
+            pred = self._predict(x, sig, keep, coords, captions=captions)
             if guidance_scale > 1.0:
                 uncond = self._predict(x, sig, keep, coords, negative=True)
                 pred = uncond + guidance_scale * (pred - uncond)
             return pred
 
-        x = torch.randn(1, S, img_latent.shape[-1], generator=gen, device=self.device)
+        eps = torch.randn(1, S, img_latent.shape[-1], generator=gen, device=self.device)   # the one noise sample of this run
+        x = eps.clone()
         x[:, : img_latent.shape[1]] = img_latent
 
         sigmas = linear_quadratic_sigmas(steps).to(self.device)
@@ -449,26 +543,35 @@ class LTXBackbone:
             # SDEdit-style start: the drag video, noised to sigma = ref_init, instead of pure noise
             first = int((sigmas[:-1] > ref_init).sum())
             s0 = float(sigmas[first])
-            x = (1 - s0) * ref_tokens + s0 * torch.randn(ref_tokens.shape, generator=gen, device=self.device)
+            x = (1 - s0) * ref_tokens + s0 * eps
             x[:, : img_latent.shape[1]] = img_latent
 
         for i in range(first, steps):
             s, s_next = sigmas[i], sigmas[i + 1]
             sig = torch.full((1, S), float(s), device=self.device)
 
-            pred = velocity(x, sig, use_motion)
-            if use_motion and motion_guidance != 1.0:
+            on = use_motion and float(s) >= adapter_min_sigma
+            pred = velocity(x, sig, on)
+            if use_motion and (motion_guidance != 1.0 or near is not None):
                 off = velocity(x, sig, False)
-                pred = off + motion_guidance * (pred - off)
+                if motion_guidance != 1.0:
+                    pred = off + motion_guidance * (pred - off)
+                if near is not None:
+                    pred = off + near * (pred - off)   # background tokens follow the plain-LTX velocity
 
             # pred is the velocity (noise - x0); sigma decreases, so s_next - s < 0
             x_new = x + (s_next - s) * pred
+            if comp_near is not None and float(s_next) >= release:
+                known = (1 - s_next) * ref_tokens + s_next * eps          # the object-free scene at the next noise level
+                x_new = comp_near * x_new + (1 - comp_near) * known
             x = torch.where(keep.unsqueeze(-1), x, x_new)
 
             if progress is not None:
                 progress((i + 1) / steps)
 
         self.motion.set_context(None)
+        self.motion.scale = 1.0
+        self._enc_gen = None
         latents = unpack_latents(x, Fl, Hl, Wl)
         return self.decode_latents(latents, decode_timestep, generator=gen)[0]
 

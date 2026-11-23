@@ -26,9 +26,13 @@ class TrajectoryDataset(Dataset):
         augment=False,
         mask_loss=True,
         reference=False,
+        captions=True,
+        speed_aug=True,
     ):
         # augment (train only): a random tracked point per visit (tracks.npy) and a random mirror flip
         self.augment = augment
+        self.speed_aug = speed_aug  # augment: sometimes take every 2nd frame (2x faster motion); False = the earlier behaviour
+        self.captions = captions  # use <clip>/caption.txt (scripts/caption_clips.py) as the clip's own text prompt
         self.reference = reference  # also return a rendered "drag video" (src/reference.py) as an extra condition
         self.mask_loss = mask_loss  # False: SAM 2 masks only on the INPUT side (conditioning frame), never to weight the loss
         self.repeat = repeat  # visit every clip this many times per epoch (each visit = a new random crop)
@@ -62,7 +66,7 @@ class TrajectoryDataset(Dataset):
         F = self.num_frames
 
         # augment: sometimes take every 2nd frame (2x faster motion) when the clip is long enough
-        stride = 2 if self.augment and self.random_crop and length > 2 * (F - 1) and np.random.rand() < 0.5 else 1
+        stride = 2 if self.augment and self.speed_aug and self.random_crop and length > 2 * (F - 1) and np.random.rand() < 0.5 else 1
         start = np.random.randint(0, length - (F - 1) * stride) if self.random_crop else 0
         ids = start + stride * np.arange(F)
 
@@ -97,6 +101,7 @@ class TrajectoryDataset(Dataset):
 
         item = {
             "name": name,
+            "caption": read_caption(folder) if self.captions else "",
             "start": start,
             "trajectory": torch.from_numpy(trajectory).float(),
             "visible": torch.from_numpy(visible).bool(),
@@ -219,6 +224,22 @@ class TrajectoryDataset(Dataset):
             mask = shift_mask(mask, int(round(shift[0])), int(round(shift[1])))
 
         return mask, area
+
+
+def read_caption(folder):
+    path = os.path.join(folder, "caption.txt")
+    return open(path, encoding="utf-8").read().strip() if os.path.exists(path) else ""
+
+
+def collect_prompts(root, splits=("train", "val")):
+    """All distinct clip captions under root, for the backbone to encode once."""
+    found = set()
+    for s in splits:
+        d = os.path.join(root, s)
+        if os.path.isdir(d):
+            found.update(read_caption(os.path.join(d, n)) for n in os.listdir(d))
+    found.discard("")
+    return sorted(found)
 
 
 def mask_from_lowres(lowres, H, W):
