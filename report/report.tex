@@ -70,10 +70,28 @@ diag & 0.48 & \textbf{0.59} & 0.143 & \textbf{0.120}\\
 \captionof{figure}{Boat clip: input and path; plain LTX-Video; adapter at $\times6$ (the boat moves but is stretched); adapter with drag-video start (clean move, faint ghost).}
 \end{minipage}
 
-\textbf{Reading.} The adapter follows the path better than plain LTX-Video (object error $-10\%$, direction cosine and progress roughly doubled or better, PCK@10 $+0.06$) while the background and image quality are unchanged, as designed. Plain LTX-Video's direction scores for opposite paths are exact negatives (left $-0.16$, right $+0.16$): it moves the object the same way whatever the path, so its score only reflects a fixed drift. The adapter's improvement is uneven: right and diagonal improve clearly, left does not change and up stays wrong-signed, so the forward/backward asymmetry noted by the instructor remains. Per clip the picture is mixed: large wins (clip 000504 right: ATE 0.209 $\to$ 0.037; 000542 diagonal: 0.186 $\to$ 0.062) and losses (000028 down: 0.072 $\to$ 0.129; 000128 right: 0.080 $\to$ 0.122), and in many pairs neither video moves the object (identical ATE).
+\begin{minipage}[t]{0.55\linewidth}\vspace{0pt}
+\textbf{Reading.} The adapter follows the path better than plain LTX-Video (object error $-10\%$, direction cosine and progress roughly doubled or better, PCK@10 $+0.06$) while the background and image quality are unchanged, as designed. Plain LTX-Video's direction scores for opposite paths are exact negatives (left $-0.16$, right $+0.16$): it moves the object the same way whatever the path, so its score only reflects a fixed drift. The adapter's improvement is uneven: right and diagonal improve clearly, left does not change and up stays wrong-signed, so the forward/backward asymmetry noted by the instructor remains. Per clip the picture is mixed: large wins (clip 000504 right: ATE 0.209 $\to$ 0.037; 000542 diagonal: 0.186 $\to$ 0.062) and losses (000028 down: 0.072 $\to$ 0.129; 000128 right: 0.080 $\to$ 0.122), and in many pairs neither video moves the object (identical ATE). Figure~2 shows one such clip, the cyclist, on all five paths: the visible difference between plain LTX-Video and the adapter is small, with the rider shifted slightly towards the target on the right and diagonal paths.
+\end{minipage}\hfill
+\begin{minipage}[t]{0.43\linewidth}\vspace{0pt}
+\centering
+\includegraphics[width=\linewidth]{figures/Bench_cyclist.png}
+\captionof{figure}{Cyclist clip, last frame, five paths (rows): input with the path, plain LTX-Video, adapter at $\times3$.}
+\end{minipage}
 
 \section{Focus loss ON vs.\ OFF}
-We retrained the same recipe with the focus loss off (\texttt{--focus\_loss 0}, seed 0, 5 epochs). On the 16 validation clips (unweighted for both runs) the object-token gain was, for epochs 1--5 with focus OFF: $-0.98,\,-0.19,\,+0.09,\,+0.27,\,+0.20\,(\times10^{-3})$; with focus ON: $-0.43,\,-0.24,\,-0.15,\,+0.01,\,-1.02\,(\times10^{-3})$. The background gain is about the same in both ($+0.13$ vs.\ $+0.12\times10^{-3}$ at epoch 4). So the focus loss did not help on validation; without it the gain turned positive earlier and stayed positive. Three caveats: the differences are about $3\times10^{-4}$ from a single seed; the OFF run used a 5-epoch learning-rate schedule and the ON run a 10-epoch one, so their schedules differ; and the validation loss cannot show whether the object follows the path. Qualitatively (3 clips, right path, strengths $\times1$, $\times3$, $\times6$) the two models look alike: only the boat moves, and only at $\times6$. We have not yet benchmarked the focus-OFF model (object error, direction, background drift per path), so we make no claim about path following or the background beyond validation.
+We retrained the same recipe with the focus loss off (\texttt{--focus\_loss 0}, seed 0, 5 epochs). On the 16 validation clips (unweighted for both runs) the object-token gain was as in Table~3. The background gain is about the same in both ($+0.13$ vs.\ $+0.12\times10^{-3}$ at epoch 4). So the focus loss did not help on validation; without it the gain turned positive earlier and stayed positive.
+\begin{center}\small
+\begin{tabular}{@{}lccccc@{}}
+\toprule
+Table 3: object gain ($\times10^{-3}$) & ep.\ 1 & ep.\ 2 & ep.\ 3 & ep.\ 4 & ep.\ 5\\
+\midrule
+Focus ON (10-epoch schedule) & $-0.43$ & $-0.24$ & $-0.15$ & $+0.01$ & $-1.02$\\
+Focus OFF (5-epoch schedule) & $-0.98$ & $-0.19$ & $+0.09$ & $+0.27$ & $+0.20$\\
+\bottomrule
+\end{tabular}
+\end{center}
+Three caveats: the differences are about $3\times10^{-4}$ from a single seed; the OFF run used a 5-epoch learning-rate schedule and the ON run a 10-epoch one, so their schedules differ; and the validation loss cannot show whether the object follows the path. Qualitatively (3 clips, right path, strengths $\times1$, $\times3$, $\times6$) the two models look alike: only the boat moves, and only at $\times6$. We have not yet benchmarked the focus-OFF model (object error, direction, background drift per path), so we make no claim about path following or the background beyond validation.
 
 \section{Limitations and future work}
 The benchmark is small (8 clips, 1 seed, no out-of-domain images) and run at a strength ($\times3$) above the trained one, so the gains are indicative, not significant. The validation gain stayed close to zero, so we do not claim the adapter learned the path robustly. Next steps: focus-loss on/off ablation, mean $\pm$ std over several seeds, out-of-domain clean images, a higher learning rate with a stronger focus loss, and fixing partial masks (the cyclist) before retraining.
